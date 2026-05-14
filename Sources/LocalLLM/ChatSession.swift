@@ -1,5 +1,19 @@
 import Foundation
+import MLX
 import MLXLMCommon
+
+/// Carries the KV cache + a cursor marking how many input tokens are already in it
+/// across the multiple passes of one tool-using turn. We reuse the cache so that
+/// pass N+1 only processes the newly-appended tool-result tokens instead of re-
+/// evaluating the entire transcript from scratch.
+private final class ToolLoopState: @unchecked Sendable {
+    var cache: [KVCache]?
+    /// Number of *prompt* tokens (from the chat template render) already absorbed.
+    /// Generated tokens are also in the cache but are counted separately because
+    /// the next pass's chat-template render will *replace* them with the same
+    /// content rendered into the assistant turn, so they line up identically.
+    var consumedInputTokens: Int = 0
+}
 
 public actor ChatSession {
     public private(set) var transcript: [ChatMessage] = []
@@ -8,6 +22,11 @@ public actor ChatSession {
     public var maxToolPasses: Int = 6
 
     private let llm: LocalLLM
+
+    /// KV cache + consumed-token cursor that survives across user turns within this
+    /// session. Invalidated when the transcript prefix is no longer guaranteed to
+    /// match (system prompt edit, condense, etc.).
+    private let cacheState = ToolLoopState()
 
     public init(llm: LocalLLM, systemPrompt: String? = nil) {
         self.llm = llm
@@ -22,11 +41,19 @@ public actor ChatSession {
     }
 
     public func setSystemPrompt(_ prompt: String) {
+        invalidateCache()
         if let first = transcript.first, first.role == .system {
             transcript[0].content = prompt
         } else {
             transcript.insert(ChatMessage(role: .system, content: prompt), at: 0)
         }
+    }
+
+    /// Drops the persistent KV cache. Used when the transcript prefix changes shape
+    /// (system prompt edit, condense, etc.) so the next pass starts from a clean slate.
+    public func invalidateCache() {
+        cacheState.cache = nil
+        cacheState.consumedInputTokens = 0
     }
 
     public func append(_ message: ChatMessage) {
@@ -35,6 +62,7 @@ public actor ChatSession {
 
     @discardableResult
     public func condense(keepingLastExchanges pairs: Int = 1) -> [ChatMessage] {
+        invalidateCache()
         var kept: [ChatMessage] = []
         if let first = transcript.first, first.role == .system {
             kept.append(first)
@@ -85,6 +113,10 @@ public actor ChatSession {
         var generationSeconds: Double = 0
         var passCount = 0
 
+        // KV cache reuse: passes within this turn AND subsequent turns of this
+        // session all share `cacheState`. The cursor advances monotonically.
+        let loopState = self.cacheState
+
         defer {
             let stats = LocalLLMGenerationStats(
                 promptTokens: promptTokens,
@@ -97,17 +129,24 @@ public actor ChatSession {
         }
 
         for pass in 0..<maxToolPasses {
-            let (assistantText, calls, info) = try await singlePass(tools: tools, continuation: continuation)
+            let (rawText, visibleText, calls, info) = try await singlePass(
+                tools: tools,
+                state: loopState,
+                continuation: continuation
+            )
             passCount += 1
             promptTokens += info.promptTokenCount
             generationTokens += info.generationTokenCount
             promptSeconds += info.promptTime
             generationSeconds += info.generateTime
 
-            self.transcript.append(ChatMessage(role: .assistant, content: assistantText))
+            // Store the raw model output (including any <tool_call> tags) so the next
+            // pass's chat-template re-render produces tokens that align with the cache.
+            // The UI shows `visibleText` via the streamed .text events, not this field.
+            self.transcript.append(ChatMessage(role: .assistant, content: rawText))
 
             if calls.isEmpty {
-                if assistantText.isEmpty {
+                if visibleText.isEmpty {
                     continuation.yield(.text(
                         "[The model produced no visible output. Try rephrasing the question.]"
                     ))
@@ -144,8 +183,9 @@ public actor ChatSession {
 
     private func singlePass(
         tools: [any LocalLLMTool],
+        state: ToolLoopState,
         continuation: AsyncThrowingStream<LocalLLMEvent, Error>.Continuation
-    ) async throws -> (text: String, calls: [(name: String, arguments: [String: String])], info: GenerateCompletionInfo) {
+    ) async throws -> (raw: String, text: String, calls: [(name: String, arguments: [String: String])], info: GenerateCompletionInfo) {
         let snapshot = Self.applyingSystemAddenda(to: self.transcript, hasTools: !tools.isEmpty)
         let container = try await self.llm.requireContainer()
         let parameters = await self.llm.generateParameters(forTools: !tools.isEmpty)
@@ -155,8 +195,40 @@ public actor ChatSession {
             let toolSpecs: [[String: Any]]? = tools.isEmpty
                 ? nil
                 : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
-            let input = try await context.processor.prepare(
+            let fullInput = try await context.processor.prepare(
                 input: UserInput(chat: chatMessages, tools: toolSpecs)
+            )
+
+            // Figure out what the iterator should actually process this pass.
+            // If the cache already holds a prefix matching the front of this
+            // pass's tokens, skip those — pass eats only the new tail.
+            let fullTokens: MLXArray = fullInput.text.tokens
+            let totalCount = fullTokens.dim(-1)
+            let consumed = state.consumedInputTokens
+            let canReuse = state.cache != nil && consumed > 0 && consumed < totalCount
+
+            let iterInput: LMInput
+            if canReuse {
+                let tail = fullTokens[consumed ..< totalCount]
+                iterInput = LMInput(text: LMInput.Text(tokens: tail))
+            } else {
+                state.cache = context.model.newCache(parameters: parameters)
+                iterInput = fullInput
+            }
+            let cache = state.cache!
+
+            let promptStart = Date.timeIntervalSinceReferenceDate
+            let iterator = try TokenIterator(
+                input: iterInput,
+                model: context.model,
+                cache: cache,
+                parameters: parameters
+            )
+
+            let additionalEOSTokenIds = Set(
+                context.configuration.extraEOSTokens.compactMap {
+                    context.tokenizer.convertTokenToId($0)
+                }
             )
 
             var text = ""
@@ -165,13 +237,24 @@ public actor ChatSession {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
             let parser = ToolStreamParser()
 
-            let info = try MLXLMCommon.generate(
-                input: input,
-                parameters: parameters,
-                context: context
-            ) { token in
-                if Task.isCancelled { return .stop }
+            var promptTime: TimeInterval = 0
+            var generationStart = promptStart
+            var generationTokenCount = 0
+
+            for token in iterator {
+                if Task.isCancelled { break }
+                if promptTime == 0 {
+                    let now = Date.timeIntervalSinceReferenceDate
+                    promptTime = now - promptStart
+                    generationStart = now
+                }
+                if token == context.tokenizer.unknownTokenId
+                    || token == context.tokenizer.eosTokenId
+                    || additionalEOSTokenIds.contains(token) {
+                    break
+                }
                 detokenizer.append(token: token)
+                generationTokenCount += 1
                 if let chunk = detokenizer.next() {
                     rawAccumulated += chunk
                     for output in parser.ingest(chunk) {
@@ -184,7 +267,6 @@ public actor ChatSession {
                         }
                     }
                 }
-                return .more
             }
 
             for output in parser.finish() {
@@ -194,8 +276,23 @@ public actor ChatSession {
                 }
             }
 
-            _ = rawAccumulated
-            return (text, calls, info)
+            // MLX runs token generation through asyncEval; synchronize before returning
+            // so the cache state is fully written before the next pass reads it.
+            Stream().synchronize()
+
+            // Advance the cursor: after this pass, the cache holds the entire prompt
+            // we just rendered + the tokens we generated. The next pass will re-render
+            // a *longer* transcript whose prefix matches up through `totalCount + N`.
+            state.consumedInputTokens = totalCount + generationTokenCount
+
+            let generationTime = Date.timeIntervalSinceReferenceDate - generationStart
+            let info = GenerateCompletionInfo(
+                promptTokenCount: canReuse ? (totalCount - consumed) : totalCount,
+                generationTokenCount: generationTokenCount,
+                promptTime: promptTime,
+                generationTime: generationTime
+            )
+            return (rawAccumulated, text, calls, info)
         }
     }
 
@@ -217,11 +314,14 @@ public actor ChatSession {
     }
 
     private static func currentDateLine() -> String {
+        // Date-only (no clock time) so the system prompt stays byte-stable within a
+        // calendar day — needed for cross-turn KV-cache reuse. If the model needs a
+        // precise time, it can call the current_time tool.
         let f = DateFormatter()
         f.locale = .current
         f.timeZone = .current
-        f.dateFormat = "EEEE, yyyy-MM-dd HH:mm zzz"
-        return "Current date/time: \(f.string(from: Date()))."
+        f.dateFormat = "EEEE, yyyy-MM-dd"
+        return "Current date: \(f.string(from: Date()))."
     }
 
     private static func makeChatMessage(_ message: ChatMessage) -> Chat.Message {
