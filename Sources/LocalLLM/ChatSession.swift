@@ -117,6 +117,31 @@ public actor ChatSession {
         // session all share `cacheState`. The cursor advances monotonically.
         let loopState = self.cacheState
 
+        // Look up the on-disk warm-cache URL for this (model, system, tools) combo;
+        // the actual load happens inside container.perform in singlePass so the
+        // [KVCache] never crosses actor isolation. nil if no warm cache exists.
+        let warmCacheURL: URL?
+        if loopState.cache == nil {
+            let composedSystem = Self.composedSystemContent(
+                transcript: self.transcript,
+                hasTools: !tools.isEmpty
+            )
+            if !composedSystem.isEmpty {
+                let modelID = await self.llm.configuration.modelID
+                let fingerprint = PrefixCacheManager.fingerprint(
+                    modelID: modelID,
+                    composedSystemPrompt: composedSystem,
+                    tools: tools
+                )
+                warmCacheURL = await PrefixCacheManager.shared.urlIfPresent(fingerprint: fingerprint)
+                print("[prefix-cache] lookup fingerprint=\(fingerprint.prefix(12))… url=\(warmCacheURL?.lastPathComponent ?? "MISS")")
+            } else {
+                warmCacheURL = nil
+            }
+        } else {
+            warmCacheURL = nil
+        }
+
         defer {
             let stats = LocalLLMGenerationStats(
                 promptTokens: promptTokens,
@@ -129,9 +154,13 @@ public actor ChatSession {
         }
 
         for pass in 0..<maxToolPasses {
+            // Pass the warm-cache URL only on the first pass; once loopState has a
+            // cache, subsequent passes just reuse it.
+            let url = pass == 0 ? warmCacheURL : nil
             let (rawText, visibleText, calls, info) = try await singlePass(
                 tools: tools,
                 state: loopState,
+                warmCacheURL: url,
                 continuation: continuation
             )
             passCount += 1
@@ -184,6 +213,7 @@ public actor ChatSession {
     private func singlePass(
         tools: [any LocalLLMTool],
         state: ToolLoopState,
+        warmCacheURL: URL?,
         continuation: AsyncThrowingStream<LocalLLMEvent, Error>.Continuation
     ) async throws -> (raw: String, text: String, calls: [(name: String, arguments: [String: String])], info: GenerateCompletionInfo) {
         let snapshot = Self.applyingSystemAddenda(to: self.transcript, hasTools: !tools.isEmpty)
@@ -191,6 +221,18 @@ public actor ChatSession {
         let parameters = await self.llm.generateParameters(forTools: !tools.isEmpty)
 
         return try await container.perform { context in
+            // Load the on-disk warm cache (if we haven't already) — fresh [KVCache]
+            // instances per session so mutation during generation doesn't alias.
+            if state.cache == nil, let url = warmCacheURL {
+                do {
+                    let (loadedCache, tc) = try loadPrefixCacheBundle(url: url)
+                    state.cache = loadedCache
+                    state.consumedInputTokens = tc
+                    print("[prefix-cache] loaded url=\(url.lastPathComponent) promptTokenCount=\(tc) cacheCount=\(loadedCache.count) firstOffset=\(loadedCache.first?.offset ?? -1)")
+                } catch {
+                    print("[prefix-cache] load FAILED: \(error)")
+                }
+            }
             let chatMessages = snapshot.map(Self.makeChatMessage)
             let toolSpecs: [[String: Any]]? = tools.isEmpty
                 ? nil
@@ -206,6 +248,7 @@ public actor ChatSession {
             let totalCount = fullTokens.dim(-1)
             let consumed = state.consumedInputTokens
             let canReuse = state.cache != nil && consumed > 0 && consumed < totalCount
+            print("[prefix-cache] singlePass consumed=\(consumed) totalCount=\(totalCount) canReuse=\(canReuse)")
 
             let iterInput: LMInput
             if canReuse {
@@ -296,32 +339,27 @@ public actor ChatSession {
         }
     }
 
-    private static func applyingSystemAddenda(to transcript: [ChatMessage], hasTools: Bool) -> [ChatMessage] {
-        var addenda: [String] = []
-        addenda.append(currentDateLine())
-        if hasTools {
-            addenda.append(ToolPromptDefaults.toolTrustPreamble)
-        }
-        let prefix = addenda.joined(separator: "\n\n")
-
-        var copy = transcript
-        if let first = copy.first, first.role == .system {
-            copy[0].content = prefix + "\n\n" + first.content
-        } else {
-            copy.insert(ChatMessage(role: .system, content: prefix), at: 0)
-        }
-        return copy
+    /// Returns the composed system message content (preamble + chat's system prompt)
+    /// that `applyingSystemAddenda` would produce, for fingerprinting purposes.
+    private static func composedSystemContent(transcript: [ChatMessage], hasTools: Bool) -> String {
+        let base = transcript.first(where: { $0.role == .system })?.content ?? ""
+        guard hasTools else { return base }
+        return ToolPromptDefaults.toolTrustPreamble + "\n\n" + base
     }
 
-    private static func currentDateLine() -> String {
-        // Date-only (no clock time) so the system prompt stays byte-stable within a
-        // calendar day — needed for cross-turn KV-cache reuse. If the model needs a
-        // precise time, it can call the current_time tool.
-        let f = DateFormatter()
-        f.locale = .current
-        f.timeZone = .current
-        f.dateFormat = "EEEE, yyyy-MM-dd"
-        return "Current date: \(f.string(from: Date()))."
+    private static func applyingSystemAddenda(to transcript: [ChatMessage], hasTools: Bool) -> [ChatMessage] {
+        // No dynamic content injected here — keeps the system prompt byte-stable across
+        // app launches so we can persist its KV-cache to disk. The current_time tool
+        // remains available for any time-sensitive question.
+        guard hasTools else { return transcript }
+        let preamble = ToolPromptDefaults.toolTrustPreamble
+        var copy = transcript
+        if let first = copy.first, first.role == .system {
+            copy[0].content = preamble + "\n\n" + first.content
+        } else {
+            copy.insert(ChatMessage(role: .system, content: preamble), at: 0)
+        }
+        return copy
     }
 
     private static func makeChatMessage(_ message: ChatMessage) -> Chat.Message {

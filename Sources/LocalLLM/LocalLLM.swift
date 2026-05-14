@@ -195,6 +195,79 @@ public actor LocalLLM {
         ModelPreset.all.first { $0.id == configuration.modelID }
     }
 
+    /// Builds the KV cache for the static prefix (system + tools) and persists it to disk.
+    /// Cheap no-op if a cache file already exists for this (model, system, tools) combination.
+    /// Safe to call repeatedly; intended to run in the background after `load()` and after
+    /// `switchModel(...)`.
+    public func prewarmPrefix(
+        composedSystemPrompt: String,
+        tools: [any LocalLLMTool]
+    ) async {
+        let fingerprint = PrefixCacheManager.fingerprint(
+            modelID: configuration.modelID,
+            composedSystemPrompt: composedSystemPrompt,
+            tools: tools
+        )
+        if await PrefixCacheManager.shared.exists(fingerprint: fingerprint) {
+            print("[prefix-cache] prewarm skipped (already present) fingerprint=\(fingerprint.prefix(12))…")
+            return
+        }
+        guard let container else {
+            print("[prefix-cache] prewarm aborted (container nil)")
+            return
+        }
+        print("[prefix-cache] prewarm starting fingerprint=\(fingerprint.prefix(12))…")
+
+        try? await container.perform { context in
+            let toolSpecs = tools.isEmpty
+                ? nil
+                : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
+            let messages: [[String: Any]] = [["role": "system", "content": composedSystemPrompt]]
+            let promptTokens: [Int]
+            do {
+                promptTokens = try context.tokenizer.applyChatTemplate(
+                    messages: messages,
+                    chatTemplate: nil,
+                    addGenerationPrompt: false,
+                    truncation: false,
+                    maxLength: nil,
+                    tools: toolSpecs
+                )
+            } catch {
+                return
+            }
+
+            let lmInput = LMInput(tokens: MLXArray(promptTokens))
+            let cache = context.model.newCache(parameters: nil)
+            // Constructing the iterator runs the chunked prefill into `cache`; we never
+            // call next() so no tokens are generated — cache holds exactly the prefix.
+            _ = try TokenIterator(
+                input: lmInput,
+                model: context.model,
+                cache: cache,
+                parameters: GenerateParameters()
+            )
+            // Drain all pending GPU work into materialized arrays BEFORE save. Without
+            // this `save()` internally calls eval() which collides with the in-flight
+            // asyncEval from the iterator's prepare step, crashing with
+            //   "A command encoder is already encoding to this command buffer".
+            let stateArrays = cache.flatMap { $0.state }
+            eval(stateArrays)
+            Stream().synchronize()
+            let destination = await PrefixCacheManager.shared.reserveURL(for: fingerprint)
+            do {
+                try savePrefixCacheBundle(
+                    url: destination,
+                    cache: cache,
+                    promptTokenCount: promptTokens.count
+                )
+                print("[prefix-cache] prewarm saved tokens=\(promptTokens.count) -> \(destination.lastPathComponent)")
+            } catch {
+                print("[prefix-cache] prewarm save FAILED: \(error)")
+            }
+        }
+    }
+
     func generateParameters(forTools: Bool = false) -> GenerateParameters {
         GenerateParameters(
             maxTokens: configuration.maxTokens,
