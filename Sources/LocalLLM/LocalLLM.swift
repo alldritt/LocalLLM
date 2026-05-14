@@ -209,14 +209,14 @@ public actor LocalLLM {
             tools: tools
         )
         if await PrefixCacheManager.shared.exists(fingerprint: fingerprint) {
-            print("[prefix-cache] prewarm skipped (already present) fingerprint=\(fingerprint.prefix(12))…")
+            prefixCacheLog.debug("prewarm skipped (already present) fingerprint=\(fingerprint.prefix(12), privacy: .public)…")
             return
         }
         guard let container else {
-            print("[prefix-cache] prewarm aborted (container nil)")
+            prefixCacheLog.error("prewarm aborted (container nil)")
             return
         }
-        print("[prefix-cache] prewarm starting fingerprint=\(fingerprint.prefix(12))…")
+        prefixCacheLog.info("prewarm starting fingerprint=\(fingerprint.prefix(12), privacy: .public)…")
 
         try? await container.perform { context in
             let toolSpecs = tools.isEmpty
@@ -261,9 +261,9 @@ public actor LocalLLM {
                     cache: cache,
                     promptTokenCount: promptTokens.count
                 )
-                print("[prefix-cache] prewarm saved tokens=\(promptTokens.count) -> \(destination.lastPathComponent)")
+                prefixCacheLog.info("prewarm saved tokens=\(promptTokens.count) -> \(destination.lastPathComponent, privacy: .public)")
             } catch {
-                print("[prefix-cache] prewarm save FAILED: \(error)")
+                prefixCacheLog.error("prewarm save FAILED: \(error.localizedDescription, privacy: .public)")
             }
         }
     }

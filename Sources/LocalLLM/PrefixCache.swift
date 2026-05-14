@@ -2,6 +2,11 @@ import Foundation
 import CryptoKit
 import MLX
 import MLXLMCommon
+import os
+
+/// Shared logger for the prefix-cache subsystem. Silent by default; stream with:
+///   `log stream --subsystem com.localllm --category prefix-cache`
+let prefixCacheLog = Logger(subsystem: "com.localllm", category: "prefix-cache")
 
 /// Writes a `[KVCache]` to disk in a simple safetensors layout that round-trips
 /// correctly for KVCacheSimple. We can't use MLXLMCommon.savePromptCache because

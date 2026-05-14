@@ -134,7 +134,7 @@ public actor ChatSession {
                     tools: tools
                 )
                 warmCacheURL = await PrefixCacheManager.shared.urlIfPresent(fingerprint: fingerprint)
-                print("[prefix-cache] lookup fingerprint=\(fingerprint.prefix(12))… url=\(warmCacheURL?.lastPathComponent ?? "MISS")")
+                prefixCacheLog.debug("lookup fingerprint=\(fingerprint.prefix(12), privacy: .public)… url=\(warmCacheURL?.lastPathComponent ?? "MISS", privacy: .public)")
             } else {
                 warmCacheURL = nil
             }
@@ -228,9 +228,9 @@ public actor ChatSession {
                     let (loadedCache, tc) = try loadPrefixCacheBundle(url: url)
                     state.cache = loadedCache
                     state.consumedInputTokens = tc
-                    print("[prefix-cache] loaded url=\(url.lastPathComponent) promptTokenCount=\(tc) cacheCount=\(loadedCache.count) firstOffset=\(loadedCache.first?.offset ?? -1)")
+                    prefixCacheLog.debug("loaded url=\(url.lastPathComponent, privacy: .public) promptTokenCount=\(tc) cacheCount=\(loadedCache.count) firstOffset=\(loadedCache.first?.offset ?? -1)")
                 } catch {
-                    print("[prefix-cache] load FAILED: \(error)")
+                    prefixCacheLog.error("load FAILED: \(error.localizedDescription, privacy: .public)")
                 }
             }
             let chatMessages = snapshot.map(Self.makeChatMessage)
@@ -248,7 +248,7 @@ public actor ChatSession {
             let totalCount = fullTokens.dim(-1)
             let consumed = state.consumedInputTokens
             let canReuse = state.cache != nil && consumed > 0 && consumed < totalCount
-            print("[prefix-cache] singlePass consumed=\(consumed) totalCount=\(totalCount) canReuse=\(canReuse)")
+            prefixCacheLog.debug("singlePass consumed=\(consumed) totalCount=\(totalCount) canReuse=\(canReuse, privacy: .public)")
 
             let iterInput: LMInput
             if canReuse {
