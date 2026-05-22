@@ -15,6 +15,21 @@ private final class ToolLoopState: @unchecked Sendable {
     var consumedInputTokens: Int = 0
 }
 
+/// Errors surfaced from `ChatSession.streamResponse`.
+public enum ChatSessionError: Error, LocalizedError, Sendable {
+    /// Rendered prompt exceeded the configured context window. Host should
+    /// either condense the transcript, shorten the user message, or raise
+    /// `Configuration.maxContextTokens`.
+    case contextOverflow(promptTokens: Int, budget: Int, maxContextTokens: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .contextOverflow(let prompt, let budget, let maxCtx):
+            return "Prompt (\(prompt) tokens) exceeds available context budget (\(budget) of \(maxCtx) tokens). Condense the transcript or raise maxContextTokens."
+        }
+    }
+}
+
 public actor ChatSession {
     public private(set) var transcript: [ChatMessage] = []
     /// Hard cap on tool-call passes per user turn — prevents runaway loops if the model
@@ -220,6 +235,14 @@ public actor ChatSession {
         let container = try await self.llm.requireContainer()
         let parameters = await self.llm.generateParameters(forTools: !tools.isEmpty)
 
+        // Capture context-window enforcement values before crossing into the
+        // container's isolation domain. Reserve room for the response but never
+        // give the output cap more than 25% of the total window.
+        let configSnapshot = await self.llm.configuration
+        let maxCtx = configSnapshot.maxContextTokens
+        let maxOut = configSnapshot.maxTokens
+        let promptBudget = max(maxCtx - maxOut, (maxCtx * 3) / 4)
+
         return try await container.perform { context in
             // Load the on-disk warm cache (if we haven't already) — fresh [KVCache]
             // instances per session so mutation during generation doesn't alias.
@@ -246,6 +269,18 @@ public actor ChatSession {
             // pass's tokens, skip those — pass eats only the new tail.
             let fullTokens: MLXArray = fullInput.text.tokens
             let totalCount = fullTokens.dim(-1)
+
+            // Context-window enforcement. Throw before allocating a fresh cache
+            // or starting an iterator — if the host doesn't catch and condense,
+            // running anyway would either OOM or silently truncate quality.
+            if totalCount > promptBudget {
+                throw ChatSessionError.contextOverflow(
+                    promptTokens: totalCount,
+                    budget: promptBudget,
+                    maxContextTokens: maxCtx
+                )
+            }
+
             let consumed = state.consumedInputTokens
             let canReuse = state.cache != nil && consumed > 0 && consumed < totalCount
             prefixCacheLog.debug("singlePass consumed=\(consumed) totalCount=\(totalCount) canReuse=\(canReuse, privacy: .public)")
