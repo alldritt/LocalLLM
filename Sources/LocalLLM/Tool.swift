@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 
 public protocol LocalLLMTool: Sendable {
@@ -82,3 +83,5 @@ enum ToolSpecBuilder {
         ]
     }
 }
+
+#endif

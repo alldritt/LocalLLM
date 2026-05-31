@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import MLX
 import MLXLMCommon
@@ -408,3 +409,4 @@ public actor ChatSession {
     }
 
 }
+#endif

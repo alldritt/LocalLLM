@@ -17,11 +17,11 @@ let package = Package(
         .target(
             name: "LocalLLM",
             dependencies: [
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
-                .product(name: "MLXLLM", package: "mlx-swift-examples"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-examples")
+                .product(name: "MLX", package: "mlx-swift", condition: .when(platforms: [.macOS])),
+                .product(name: "MLXNN", package: "mlx-swift", condition: .when(platforms: [.macOS])),
+                .product(name: "MLXRandom", package: "mlx-swift", condition: .when(platforms: [.macOS])),
+                .product(name: "MLXLLM", package: "mlx-swift-examples", condition: .when(platforms: [.macOS])),
+                .product(name: "MLXLMCommon", package: "mlx-swift-examples", condition: .when(platforms: [.macOS]))
             ]
         ),
         .testTarget(

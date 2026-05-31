@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import MLX
 import MLXLLM
@@ -345,3 +346,5 @@ public actor LocalLLM {
         return total
     }
 }
+
+#endif

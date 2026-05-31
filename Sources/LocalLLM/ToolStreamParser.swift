@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 
 /// Parses a token-by-token text stream from a tool-calling model, separating visible text
@@ -122,3 +123,5 @@ final class ToolStreamParser {
         }
     }
 }
+
+#endif

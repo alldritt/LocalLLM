@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 
 public struct ChatMessage: Sendable, Hashable, Codable, Identifiable {
@@ -18,3 +19,5 @@ public struct ChatMessage: Sendable, Hashable, Codable, Identifiable {
         self.content = content
     }
 }
+
+#endif

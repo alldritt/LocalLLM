@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import CryptoKit
 import MLX
@@ -186,3 +187,5 @@ public actor PrefixCacheManager {
         }
     }
 }
+
+#endif
