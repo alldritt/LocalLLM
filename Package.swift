@@ -21,7 +21,8 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift", condition: .when(platforms: [.macOS])),
                 .product(name: "MLXRandom", package: "mlx-swift", condition: .when(platforms: [.macOS])),
                 .product(name: "MLXLLM", package: "mlx-swift-examples", condition: .when(platforms: [.macOS])),
-                .product(name: "MLXLMCommon", package: "mlx-swift-examples", condition: .when(platforms: [.macOS]))
+                .product(name: "MLXLMCommon", package: "mlx-swift-examples", condition: .when(platforms: [.macOS])),
+                .product(name: "StableDiffusion", package: "mlx-swift-examples", condition: .when(platforms: [.macOS]))
             ]
         ),
         .testTarget(

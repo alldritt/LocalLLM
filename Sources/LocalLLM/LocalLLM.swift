@@ -178,6 +178,15 @@ public actor LocalLLM {
         update(&configuration)
     }
 
+    /// Drops the in-memory model, freeing its (multi-GB) weights. The next
+    /// `load()` reloads from the on-disk cache. Used to coordinate residency
+    /// with the image generator so a large text model and a large diffusion
+    /// model are never resident at the same time.
+    public func unload() {
+        container = nil
+        state = .idle
+    }
+
     /// Drops the currently-loaded model and loads the chosen preset. The progress
     /// callback receives the same LoadState transitions as the initial `load()`.
     public func switchModel(
@@ -327,10 +336,14 @@ public actor LocalLLM {
 
     private static func directorySize(at url: URL) -> Int64 {
         let fm = FileManager.default
+        // NOTE: do NOT skip hidden files. HuggingFace streams in-progress
+        // downloads into a hidden `.cache/huggingface/download/*.incomplete`
+        // subdirectory and only moves them to the visible path on completion;
+        // skipping hidden files would report 0 bytes for the entire download.
         guard let enumerator = fm.enumerator(
             at: url,
             includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileSizeKey],
-            options: [.skipsHiddenFiles],
+            options: [],
             errorHandler: nil
         ) else { return 0 }
 
