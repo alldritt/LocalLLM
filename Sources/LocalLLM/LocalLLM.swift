@@ -17,6 +17,43 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
         self.expectedDownloadBytes = expectedDownloadBytes
     }
 
+    public static let qwen3_32B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3-32B-4bit",
+        displayName: "Qwen 3 32B (4-bit)",
+        parameterLabel: "32B",
+        expectedDownloadBytes: 18_400_000_000
+    )
+
+    /// MoE: 30B total weights resident, only ~3B active per token — runs much
+    /// faster than the dense 32B at a similar memory footprint.
+    public static let qwen3_30B_A3B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3-30B-A3B-4bit",
+        displayName: "Qwen 3 30B A3B MoE (4-bit)",
+        parameterLabel: "30B-A3B",
+        expectedDownloadBytes: 17_200_000_000
+    )
+
+    public static let qwen3_14B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3-14B-4bit",
+        displayName: "Qwen 3 14B (4-bit)",
+        parameterLabel: "14B",
+        expectedDownloadBytes: 8_310_000_000
+    )
+
+    public static let qwen3_8B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3-8B-4bit",
+        displayName: "Qwen 3 8B (4-bit)",
+        parameterLabel: "8B",
+        expectedDownloadBytes: 4_610_000_000
+    )
+
+    public static let qwen3_4B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3-4B-4bit",
+        displayName: "Qwen 3 4B (4-bit)",
+        parameterLabel: "4B",
+        expectedDownloadBytes: 2_260_000_000
+    )
+
     public static let qwen2_5_32B_4bit = ModelPreset(
         id: "mlx-community/Qwen2.5-32B-Instruct-4bit",
         displayName: "Qwen 2.5 32B Instruct (4-bit)",
@@ -53,6 +90,11 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
     )
 
     public static let all: [ModelPreset] = [
+        .qwen3_32B_4bit,
+        .qwen3_30B_A3B_4bit,
+        .qwen3_14B_4bit,
+        .qwen3_8B_4bit,
+        .qwen3_4B_4bit,
         .qwen2_5_32B_4bit,
         .qwen2_5_14B_4bit,
         .qwen2_5_7B_4bit,
@@ -91,6 +133,11 @@ public actor LocalLLM {
         /// Rough total download size for the configured model. Used only to drive the progress bar
         /// because the HF Hub progress is file-count-weighted and crawls inside large shards.
         public var expectedDownloadBytes: Int64
+        /// Forwarded to the chat template as the `enable_thinking` kwarg. Qwen3 reads this to
+        /// emit (or suppress) its `<think>…</think>` reasoning block; templates that don't
+        /// reference the kwarg (Qwen2.5, Llama) simply ignore it. Defaults to `false` because
+        /// node/tool-calling flows want fast, direct answers without reasoning-token overhead.
+        public var enableThinking: Bool
 
         public init(
             modelID: String = "mlx-community/Qwen2.5-32B-Instruct-4bit",
@@ -100,7 +147,8 @@ public actor LocalLLM {
             maxContextTokens: Int = 8192,
             estimatedCharsPerToken: Double = 3.5,
             expectedDownloadBytes: Int64 = 18_400_000_000,
-            toolTemperature: Float = 0.2
+            toolTemperature: Float = 0.2,
+            enableThinking: Bool = false
         ) {
             self.modelID = modelID
             self.maxTokens = maxTokens
@@ -110,6 +158,7 @@ public actor LocalLLM {
             self.estimatedCharsPerToken = estimatedCharsPerToken
             self.expectedDownloadBytes = expectedDownloadBytes
             self.toolTemperature = toolTemperature
+            self.enableThinking = enableThinking
         }
     }
 

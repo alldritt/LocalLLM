@@ -242,6 +242,7 @@ public actor ChatSession {
         let configSnapshot = await self.llm.configuration
         let maxCtx = configSnapshot.maxContextTokens
         let maxOut = configSnapshot.maxTokens
+        let enableThinking = configSnapshot.enableThinking
         let promptBudget = max(maxCtx - maxOut, (maxCtx * 3) / 4)
 
         return try await container.perform { context in
@@ -262,7 +263,13 @@ public actor ChatSession {
                 ? nil
                 : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
             let fullInput = try await context.processor.prepare(
-                input: UserInput(chat: chatMessages, tools: toolSpecs)
+                input: UserInput(
+                    chat: chatMessages,
+                    tools: toolSpecs,
+                    // Qwen3 reads `enable_thinking` from the template kwargs to emit or
+                    // suppress its <think> block; other templates ignore the extra key.
+                    additionalContext: ["enable_thinking": enableThinking]
+                )
             )
 
             // Figure out what the iterator should actually process this pass.
