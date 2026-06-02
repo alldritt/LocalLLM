@@ -15,17 +15,20 @@ public struct ImageModelPreset: Sendable, Identifiable, Hashable {
     /// Raw value of `StableDiffusionConfiguration.Preset` this maps to.
     let presetKey: String
 
+    // NOTE: these presets download the fp32 weights (`diffusion_pytorch_model.safetensors`,
+    // not the .fp16 variant) and convert to float16 in memory at load time. The
+    // download totals therefore reflect fp32 sizes: SDXL Turbo's UNet alone is ~10.3 GB.
     public static let sdxlTurbo = ImageModelPreset(
         id: "stabilityai/sdxl-turbo",
         displayName: "SDXL Turbo",
-        expectedDownloadBytes: 6_940_000_000,
+        expectedDownloadBytes: 13_700_000_000,
         presetKey: "sdxl-turbo"
     )
 
     public static let stableDiffusion21 = ImageModelPreset(
         id: "stabilityai/stable-diffusion-2-1-base",
         displayName: "Stable Diffusion 2.1",
-        expectedDownloadBytes: 5_200_000_000,
+        expectedDownloadBytes: 5_300_000_000,
         presetKey: "base"
     )
 
@@ -244,27 +247,58 @@ public actor LocalImageGenerator {
         let generator = try await loadGenerator()
 
         var params = configuration.preset.sdConfiguration.defaultParameters()
-        params.prompt = prompt
-        params.negativePrompt = negativePrompt
+        params.prompt = Self.clampToCLIPLimit(prompt)
+        params.negativePrompt = Self.clampToCLIPLimit(negativePrompt)
         params.latentSize = [max(8, configuration.imageEdge / 8), max(8, configuration.imageEdge / 8)]
         if let steps = configuration.steps { params.steps = steps }
         if let seed { params.seed = seed }
 
         // Build + evaluate the denoising graph step by step. Runs on the actor's
         // executor — MLXArrays never escape, so no Sendable concerns.
-        let latents = generator.generateLatents(parameters: params)
-        var lastXt: MLXArray?
-        for xt in latents {
-            eval(xt)
-            lastXt = xt
-        }
-        guard let lastXt else { throw LocalImageGenError.noOutput }
+        //
+        // Everything that touches MLX is wrapped in `withError`, which installs a
+        // scoped (task-local) error handler. Without it, any error raised inside
+        // the C++ MLX layer (bad broadcast, shape mismatch, etc.) reaches
+        // `ErrorHandler.dispatch`, finds no handler installed, and calls
+        // `fatalError` — aborting the whole process. With the handler in place
+        // the same error surfaces as a recoverable Swift `throws`
+        // (`MLXError.caught`) that our caller already maps to a generation error.
+        return try withError { mlxError in
+            let latents = generator.generateLatents(parameters: params)
+            var lastXt: MLXArray?
+            for xt in latents {
+                eval(xt)
+                lastXt = xt
+            }
+            try mlxError.check()
+            guard let lastXt else { throw LocalImageGenError.noOutput }
 
-        // Decode the final latent into an RGB raster and encode as PNG.
-        var decoded = generator.decode(xt: lastXt)
-        decoded = (decoded * 255).asType(.uint8).squeezed()
-        eval(decoded)
-        return try Self.pngData(from: Image(decoded).asCGImage())
+            // Decode the final latent into an RGB raster and encode as PNG.
+            var decoded = generator.decode(xt: lastXt)
+            decoded = (decoded * 255).asType(.uint8).squeezed()
+            eval(decoded)
+            try mlxError.check()
+            return try Self.pngData(from: Image(decoded).asCGImage())
+        }
+    }
+
+    /// CLIP's text encoder has a fixed 77-position context (75 content tokens
+    /// after the BOS/EOS markers). mlx-swift-examples' `tokenize` does NOT clamp
+    /// to this limit, so an over-long prompt produces a token sequence longer
+    /// than the position-embedding table. The encoder then tries to add a
+    /// [N, dim] activation to a [77, dim] embedding slice and MLX aborts the
+    /// process with a fatal broadcast error inside `mlx_add` (Clip.swift:112).
+    ///
+    /// `CLIPTokenizer` is internal to the package, so we can't count BPE tokens
+    /// exactly. We approximate with a conservative whitespace-word cap: CLIP BPE
+    /// averages well under ~1.4 tokens/word for ordinary prose, so 50 words
+    /// stays comfortably under the 75-token content budget while preserving the
+    /// meaningful head of the prompt.
+    nonisolated static func clampToCLIPLimit(_ text: String) -> String {
+        let maxWords = 50
+        let words = text.split(whereSeparator: \.isWhitespace)
+        guard words.count > maxWords else { return text }
+        return words.prefix(maxWords).joined(separator: " ")
     }
 
     private nonisolated static func pngData(from image: CGImage) throws -> Data {

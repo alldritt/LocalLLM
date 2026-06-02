@@ -249,21 +249,28 @@ public actor LocalLLM {
 
             let lmInput = LMInput(tokens: MLXArray(promptTokens))
             let cache = context.model.newCache(parameters: nil)
-            // Constructing the iterator runs the chunked prefill into `cache`; we never
-            // call next() so no tokens are generated — cache holds exactly the prefix.
-            _ = try TokenIterator(
-                input: lmInput,
-                model: context.model,
-                cache: cache,
-                parameters: GenerateParameters()
-            )
-            // Drain all pending GPU work into materialized arrays BEFORE save. Without
-            // this `save()` internally calls eval() which collides with the in-flight
-            // asyncEval from the iterator's prepare step, crashing with
-            //   "A command encoder is already encoding to this command buffer".
-            let stateArrays = cache.flatMap { $0.state }
-            eval(stateArrays)
-            Stream().synchronize()
+            // Guard the MLX work: prefill + eval run in the C++ layer, where an
+            // error would otherwise hit `fatalError` and abort the process. With
+            // `withError` it becomes a throw that the enclosing `try?` discards —
+            // prewarm is a best-effort cache warm, so silently skipping is fine.
+            try withError { mlxError in
+                // Constructing the iterator runs the chunked prefill into `cache`; we never
+                // call next() so no tokens are generated — cache holds exactly the prefix.
+                _ = try TokenIterator(
+                    input: lmInput,
+                    model: context.model,
+                    cache: cache,
+                    parameters: GenerateParameters()
+                )
+                // Drain all pending GPU work into materialized arrays BEFORE save. Without
+                // this `save()` internally calls eval() which collides with the in-flight
+                // asyncEval from the iterator's prepare step, crashing with
+                //   "A command encoder is already encoding to this command buffer".
+                let stateArrays = cache.flatMap { $0.state }
+                eval(stateArrays)
+                Stream().synchronize()
+                try mlxError.check()
+            }
             let destination = await PrefixCacheManager.shared.reserveURL(for: fingerprint)
             do {
                 try savePrefixCacheBundle(

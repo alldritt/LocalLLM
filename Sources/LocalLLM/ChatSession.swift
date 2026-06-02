@@ -297,12 +297,6 @@ public actor ChatSession {
             let cache = state.cache!
 
             let promptStart = Date.timeIntervalSinceReferenceDate
-            let iterator = try TokenIterator(
-                input: iterInput,
-                model: context.model,
-                cache: cache,
-                parameters: parameters
-            )
 
             let additionalEOSTokenIds = Set(
                 context.configuration.extraEOSTokens.compactMap {
@@ -320,44 +314,62 @@ public actor ChatSession {
             var generationStart = promptStart
             var generationTokenCount = 0
 
-            for token in iterator {
-                if Task.isCancelled { break }
-                if promptTime == 0 {
-                    let now = Date.timeIntervalSinceReferenceDate
-                    promptTime = now - promptStart
-                    generationStart = now
-                }
-                if token == context.tokenizer.unknownTokenId
-                    || token == context.tokenizer.eosTokenId
-                    || additionalEOSTokenIds.contains(token) {
-                    break
-                }
-                detokenizer.append(token: token)
-                generationTokenCount += 1
-                if let chunk = detokenizer.next() {
-                    rawAccumulated += chunk
-                    for output in parser.ingest(chunk) {
-                        switch output {
-                        case .text(let s):
-                            text += s
-                            continuation.yield(.text(s))
-                        case .toolCall(let name, let arguments):
-                            calls.append((name, arguments))
+            // Guard all MLX work in a scoped error handler. Prompt processing
+            // (TokenIterator construction) and per-token generation run in the
+            // C++ MLX layer, where an invalid configuration — e.g. a max-tokens /
+            // context-window combination that produces a bad shape — raises an
+            // error. With no handler installed, `ErrorHandler.dispatch` calls
+            // `fatalError` and the whole process dies; `withError` converts that
+            // same error into a recoverable Swift `throws` (`MLXError.caught`).
+            try withError { mlxError in
+                let iterator = try TokenIterator(
+                    input: iterInput,
+                    model: context.model,
+                    cache: cache,
+                    parameters: parameters
+                )
+
+                for token in iterator {
+                    if Task.isCancelled { break }
+                    if promptTime == 0 {
+                        let now = Date.timeIntervalSinceReferenceDate
+                        promptTime = now - promptStart
+                        generationStart = now
+                    }
+                    if token == context.tokenizer.unknownTokenId
+                        || token == context.tokenizer.eosTokenId
+                        || additionalEOSTokenIds.contains(token) {
+                        break
+                    }
+                    detokenizer.append(token: token)
+                    generationTokenCount += 1
+                    if let chunk = detokenizer.next() {
+                        rawAccumulated += chunk
+                        for output in parser.ingest(chunk) {
+                            switch output {
+                            case .text(let s):
+                                text += s
+                                continuation.yield(.text(s))
+                            case .toolCall(let name, let arguments):
+                                calls.append((name, arguments))
+                            }
                         }
                     }
                 }
-            }
 
-            for output in parser.finish() {
-                if case .text(let s) = output {
-                    text += s
-                    continuation.yield(.text(s))
+                for output in parser.finish() {
+                    if case .text(let s) = output {
+                        text += s
+                        continuation.yield(.text(s))
+                    }
                 }
-            }
 
-            // MLX runs token generation through asyncEval; synchronize before returning
-            // so the cache state is fully written before the next pass reads it.
-            Stream().synchronize()
+                // MLX runs token generation through asyncEval; synchronize before
+                // returning so the cache state is fully written before the next
+                // pass reads it. This also flushes any deferred eval error.
+                Stream().synchronize()
+                try mlxError.check()
+            }
 
             // Advance the cursor: after this pass, the cache holds the entire prompt
             // we just rendered + the tokens we generated. The next pass will re-render
