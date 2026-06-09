@@ -347,14 +347,86 @@ public actor LocalLLM {
         return try await load()
     }
 
-    /// `~/Library/Caches/huggingface/models--<org>--<repo>/` — matches `swift-transformers` layout.
-    private func modelCacheDirectory() -> URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    /// The model's native context window, read from its on-disk `config.json`
+    /// (`max_position_embeddings`, adjusted for any RoPE scaling and clamped to a
+    /// sliding-window cap when one is active). Returns `nil` if the model isn't
+    /// downloaded yet or the config can't be parsed — this never triggers a
+    /// download. Lets hosts size their context budget to the model instead of
+    /// guessing a fixed default.
+    public nonisolated static func nativeContextWindow(forModelID id: String) -> Int? {
+        guard let url = configJSONURL(forModelID: id),
+              let data = try? Data(contentsOf: url) else { return nil }
+
+        struct ModelConfigJSON: Decodable {
+            let maxPositionEmbeddings: Int?
+            let slidingWindow: Int?
+            let useSlidingWindow: Bool?
+            enum CodingKeys: String, CodingKey {
+                case maxPositionEmbeddings = "max_position_embeddings"
+                case slidingWindow = "sliding_window"
+                case useSlidingWindow = "use_sliding_window"
+            }
+        }
+
+        guard let cfg = try? JSONDecoder().decode(ModelConfigJSON.self, from: data),
+              let base = cfg.maxPositionEmbeddings, base > 0 else { return nil }
+
+        // `max_position_embeddings` is authoritative on modern HF configs — it
+        // already reflects the usable length even when RoPE scaling is present
+        // (llama3/yarn store the *extended* length here; `rope_scaling.factor`
+        // is an internal frequency parameter, NOT a multiplier of this value).
+        // So use it directly; multiplying by factor would wildly overshoot
+        // (e.g. Llama 3.2's 131072 × 32).
+        //
+        // A sliding window caps *effective* attention below max_position. Apply
+        // it only when the model actually enables it: Qwen2.5 ships a window but
+        // sets `use_sliding_window: false`; Qwen3 reports a null window; Mistral
+        // omits the flag but ships a real, active window.
+        if (cfg.useSlidingWindow ?? true), let sw = cfg.slidingWindow, sw > 0 {
+            return min(base, sw)
+        }
+        return base
+    }
+
+    /// Locates a model's `config.json` across the two on-disk layouts we may have
+    /// produced: the flat `<caches>/models/<repo-id>/` path (current loader) and
+    /// the HuggingFace-hub `<caches>/huggingface/models--<slug>/snapshots/<rev>/`
+    /// layout (older / hub-managed downloads).
+    private nonisolated static func configJSONURL(forModelID id: String) -> URL? {
+        let fm = FileManager.default
+        let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let slug = configuration.modelID.replacingOccurrences(of: "/", with: "--")
-        return caches
+
+        // 1. Flat layout (matches LocalImageGen.modelDirectory, where the loader
+        //    actually writes text weights).
+        let flat = caches
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(id, isDirectory: true)
+            .appendingPathComponent("config.json")
+        if fm.fileExists(atPath: flat.path) { return flat }
+
+        // 2. HF-hub layout: config.json lives under snapshots/<revision>/.
+        let slug = id.replacingOccurrences(of: "/", with: "--")
+        let hubRoot = caches
             .appendingPathComponent("huggingface", isDirectory: true)
             .appendingPathComponent("models--\(slug)", isDirectory: true)
+        guard let enumerator = fm.enumerator(
+            at: hubRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        for case let url as URL in enumerator where url.lastPathComponent == "config.json" {
+            return url
+        }
+        return nil
+    }
+
+    /// `~/Library/Caches/models/<repo-id>/` — the flat layout the loader writes
+    /// weights to (shared with image models via `LocalImageGenerator`). Used by
+    /// the download progress poller to measure on-disk bytes; must match where
+    /// the files actually land or the progress bar stays at 0%.
+    private func modelCacheDirectory() -> URL {
+        LocalImageGenerator.modelDirectory(forModelID: configuration.modelID)
     }
 
     private func startDiskPolling(
