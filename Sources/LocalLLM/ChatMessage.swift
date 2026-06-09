@@ -20,4 +20,10 @@ public struct ChatMessage: Sendable, Hashable, Codable, Identifiable {
     }
 }
 
+/// Disambiguating alias for hosts whose own module also declares a `ChatMessage`.
+/// The module name `LocalLLM` is shadowed by the `LocalLLM` actor, so
+/// `LocalLLM.ChatMessage` can't be used to qualify; this alias gives callers an
+/// unambiguous name.
+public typealias LocalLLMChatMessage = ChatMessage
+
 #endif
