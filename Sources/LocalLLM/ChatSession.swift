@@ -142,6 +142,9 @@ public actor ChatSession {
             tools + (agentOptions?.pseudoTools ?? []).map { $0.specAdapter }
         let passCap = agentOptions?.maxPasses ?? maxToolPasses
         var nudged = false
+        // Accumulated visible text across this turn's passes — the fallback result
+        // when a finish pseudo-tool arrives with an empty `result` argument.
+        var turnVisibleText = ""
 
         var promptTokens = 0
         var generationTokens = 0
@@ -193,12 +196,32 @@ public actor ChatSession {
             // Pass the warm-cache URL only on the first pass; once loopState has a
             // cache, subsequent passes just reuse it.
             let url = pass == 0 ? warmCacheURL : nil
-            let (rawText, visibleText, calls, info) = try await singlePass(
+            let (rawText, visibleText, calls, malformed, info) = try await singlePass(
                 tools: specTools,
                 state: loopState,
                 warmCacheURL: url,
                 continuation: continuation
             )
+
+            // Bare-text pseudo-call rescue: small models drift out of the
+            // <tool_call> format after long text answers and write e.g.
+            // `finish {"status": "success"}` as plain text. When a pass has no
+            // parsed calls, recognize a trailing bare invocation of a pseudo-tool
+            // and route it through the normal interception path. The invocation
+            // text is model syntax, not answer content — exclude it from the
+            // result-substitution source.
+            var effectiveCalls = calls
+            var answerText = visibleText
+            if effectiveCalls.isEmpty, malformed.isEmpty, !pseudoByName.isEmpty,
+               let bare = Self.trailingBarePseudoCall(
+                   in: visibleText, names: Array(pseudoByName.keys)
+               ) {
+                effectiveCalls.append((bare.name, bare.arguments))
+                answerText = bare.strippedText
+            }
+            if !answerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                turnVisibleText += (turnVisibleText.isEmpty ? "" : "\n") + answerText
+            }
             passCount += 1
             promptTokens += info.promptTokenCount
             generationTokens += info.generationTokenCount
@@ -210,10 +233,57 @@ public actor ChatSession {
             // The UI shows `visibleText` via the streamed .text events, not this field.
             self.transcript.append(ChatMessage(role: .assistant, content: rawText))
 
-            if calls.isEmpty {
-                if agentOptions != nil {
-                    // Agent contract: silence is not completion. One nudge to call
-                    // finish; a second silent pass ends the turn as exhaustion.
+            // A malformed tool call is neither silence nor a call — feed the parse
+            // failure back to the model as a tool error so it can repair, instead
+            // of dropping it invisibly (the pass budget still bounds retries).
+            if effectiveCalls.isEmpty, !malformed.isEmpty {
+                let msg = "Error: your tool call could not be parsed as JSON. "
+                    + "Re-emit it as a single-line JSON object; escape newlines "
+                    + "inside string values as \\n."
+                self.transcript.append(ChatMessage(role: .tool, content: msg))
+                continuation.yield(.toolResult(
+                    call: LocalLLMToolCall(name: "invalid_tool_call", arguments: [:]),
+                    content: msg,
+                    isError: true
+                ))
+                continue
+            }
+
+            if effectiveCalls.isEmpty {
+                if let options = agentOptions {
+                    // Preferred: don't ask for the sign-off — prefill it. The model
+                    // generates only the status choice, so format drift is impossible.
+                    if let signoff = options.forcedSignoff,
+                       let pseudo = pseudoByName[signoff.toolName] {
+                        let micro = try await forcedSignoffChoice(
+                            signoff: signoff, tools: specTools, state: loopState
+                        )
+                        promptTokens += micro.counts.prompt
+                        generationTokens += micro.counts.generation
+                        // Store the exact prefill+completion so the next pass's
+                        // template re-render aligns with what the KV cache holds.
+                        self.transcript.append(ChatMessage(role: .assistant, content: micro.rawText))
+                        let args = [signoff.parameterName: micro.choice]
+                        let call = LocalLLMToolCall(name: signoff.toolName, arguments: args)
+                        continuation.yield(.toolCall(call))
+                        switch await pseudo.handler(args) {
+                        case .continueLoop(let toolResult):
+                            self.transcript.append(ChatMessage(role: .tool, content: toolResult))
+                            continuation.yield(.toolResult(call: call, content: toolResult, isError: false))
+                            continue
+                        case .finish(let result, let status):
+                            self.transcript.append(ChatMessage(
+                                role: .tool,
+                                content: "Finished (\(status.rawValue))."
+                            ))
+                            let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let effective = trimmed.isEmpty ? turnVisibleText : result
+                            continuation.yield(.agentFinished(result: effective, status: status))
+                            return
+                        }
+                    }
+                    // Fallback (no forced sign-off configured): one text nudge,
+                    // then honest exhaustion.
                     if !nudged {
                         nudged = true
                         self.transcript.append(ChatMessage(
@@ -222,7 +292,7 @@ public actor ChatSession {
                         ))
                         continue
                     }
-                    continuation.yield(.budgetExhausted(passes: passCount))
+                    continuation.yield(.budgetExhausted(passes: passCount, reason: .noFinishCall))
                     return
                 }
                 if visibleText.isEmpty {
@@ -233,7 +303,7 @@ public actor ChatSession {
                 return
             }
 
-            for parsed in calls {
+            for parsed in effectiveCalls {
                 let call = LocalLLMToolCall(name: parsed.name, arguments: parsed.arguments)
                 continuation.yield(.toolCall(call))
 
@@ -249,7 +319,10 @@ public actor ChatSession {
                             role: .tool,
                             content: "Finished (\(status.rawValue))."
                         ))
-                        continuation.yield(.agentFinished(result: result, status: status))
+                        // Empty result → the turn's streamed text IS the answer.
+                        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let effective = trimmed.isEmpty ? turnVisibleText : result
+                        continuation.yield(.agentFinished(result: effective, status: status))
                         return
                     }
                 } else if let tool = toolsByName[call.name] {
@@ -269,13 +342,16 @@ public actor ChatSession {
                 }
             }
 
-            if pass == passCap - 1 {
-                if agentOptions != nil {
-                    continuation.yield(.budgetExhausted(passes: passCount))
-                } else {
-                    continuation.yield(.text("\n[Tool-call budget exhausted after \(passCap) passes.]"))
-                }
+            if pass == passCap - 1, agentOptions == nil {
+                continuation.yield(.text("\n[Tool-call budget exhausted after \(passCap) passes.]"))
             }
+        }
+
+        // Agent mode: fell off the pass loop without an explicit finish. A single
+        // post-loop check also covers continue-on-final-pass edges (nudge or
+        // sign-off bounce on the last iteration).
+        if agentOptions != nil {
+            continuation.yield(.budgetExhausted(passes: passCount, reason: .passBudget))
         }
     }
 
@@ -284,7 +360,7 @@ public actor ChatSession {
         state: ToolLoopState,
         warmCacheURL: URL?,
         continuation: AsyncThrowingStream<LocalLLMEvent, Error>.Continuation
-    ) async throws -> (raw: String, text: String, calls: [(name: String, arguments: [String: String])], info: GenerateCompletionInfo) {
+    ) async throws -> (raw: String, text: String, calls: [(name: String, arguments: [String: String])], malformed: [String], info: GenerateCompletionInfo) {
         let snapshot = Self.applyingSystemAddenda(to: self.transcript, hasTools: !tools.isEmpty)
         let container = try await self.llm.requireContainer()
         let parameters = await self.llm.generateParameters(forTools: !tools.isEmpty)
@@ -367,6 +443,7 @@ public actor ChatSession {
             var text = ""
             var rawAccumulated = ""
             var calls: [(name: String, arguments: [String: String])] = []
+            var malformed: [String] = []
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
             let parser = ToolStreamParser()
 
@@ -412,15 +489,22 @@ public actor ChatSession {
                                 continuation.yield(.text(s))
                             case .toolCall(let name, let arguments):
                                 calls.append((name, arguments))
+                            case .malformedToolCall(let raw):
+                                malformed.append(raw)
                             }
                         }
                     }
                 }
 
                 for output in parser.finish() {
-                    if case .text(let s) = output {
+                    switch output {
+                    case .text(let s):
                         text += s
                         continuation.yield(.text(s))
+                    case .toolCall(let name, let arguments):
+                        calls.append((name, arguments))
+                    case .malformedToolCall(let raw):
+                        malformed.append(raw)
                     }
                 }
 
@@ -443,8 +527,190 @@ public actor ChatSession {
                 promptTime: promptTime,
                 generationTime: generationTime
             )
-            return (rawAccumulated, text, calls, info)
+            return (rawAccumulated, text, calls, malformed, info)
         }
+    }
+
+    /// The forced sign-off micro-pass: re-renders the transcript, appends the
+    /// prefilled tool-call tokens (`<tool_call>{"name": …, "arguments": {"status": "`),
+    /// and lets the model generate only the choice value — a handful of tokens on
+    /// a warm cache. Returns the resolved choice, the exact raw text the model is
+    /// considered to have produced (prefill + completion, stored verbatim in the
+    /// transcript so the next re-render aligns with the KV cache), and token
+    /// counts for stats.
+    private func forcedSignoffChoice(
+        signoff: ForcedSignoff,
+        tools: [any LocalLLMTool],
+        state: ToolLoopState
+    ) async throws -> (choice: String, rawText: String, counts: (prompt: Int, generation: Int)) {
+        let snapshot = Self.applyingSystemAddenda(to: self.transcript, hasTools: !tools.isEmpty)
+        let container = try await self.llm.requireContainer()
+        let baseParameters = await self.llm.generateParameters(forTools: true)
+        let configSnapshot = await self.llm.configuration
+        let maxCtx = configSnapshot.maxContextTokens
+        let enableThinking = configSnapshot.enableThinking
+        let promptBudget = max(maxCtx - configSnapshot.maxTokens, (maxCtx * 3) / 4)
+
+        // Qwen3 thinking templates open every assistant turn with a think block;
+        // prefill the empty-think convention so the tool-call prefix stays
+        // in-distribution. Rendering must use the SAME enable_thinking as the
+        // main passes or the prompt prefix (and KV cache) would diverge.
+        let thinkPrefix = enableThinking ? "<think>\n\n</think>\n\n" : ""
+        let prefill = thinkPrefix
+            + "<tool_call>\n{\"name\": \"\(signoff.toolName)\", "
+            + "\"arguments\": {\"\(signoff.parameterName)\": \""
+
+        let parameters: GenerateParameters = {
+            var p = baseParameters
+            p.maxTokens = 16
+            p.temperature = 0
+            return p
+        }()
+
+        return try await container.perform { context in
+            let chatMessages = snapshot.map(Self.makeChatMessage)
+            let toolSpecs: [[String: Any]]? = tools.isEmpty
+                ? nil
+                : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
+            let fullInput = try await context.processor.prepare(
+                input: UserInput(
+                    chat: chatMessages,
+                    tools: toolSpecs,
+                    additionalContext: ["enable_thinking": enableThinking]
+                )
+            )
+            let renderedTokens: MLXArray = fullInput.text.tokens
+            let renderedCount = renderedTokens.dim(-1)
+            let prefillIDs = context.tokenizer.encode(text: prefill, addSpecialTokens: false)
+            if renderedCount + prefillIDs.count > promptBudget {
+                throw ChatSessionError.contextOverflow(
+                    promptTokens: renderedCount + prefillIDs.count,
+                    budget: promptBudget,
+                    maxContextTokens: maxCtx
+                )
+            }
+            let prefillArray = MLXArray(prefillIDs.map { Int32($0) }).asType(renderedTokens.dtype)
+
+            let consumed = state.consumedInputTokens
+            let canReuse = state.cache != nil && consumed > 0 && consumed < renderedCount
+            let iterTokens: MLXArray
+            if canReuse {
+                iterTokens = concatenated(
+                    [renderedTokens[consumed ..< renderedCount], prefillArray], axis: -1
+                )
+            } else {
+                state.cache = context.model.newCache(parameters: parameters)
+                iterTokens = concatenated([renderedTokens, prefillArray], axis: -1)
+            }
+            let cache = state.cache!
+
+            let additionalEOSTokenIds = Set(
+                context.configuration.extraEOSTokens.compactMap {
+                    context.tokenizer.convertTokenToId($0)
+                }
+            )
+            var completion = ""
+            var generated = 0
+            var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+
+            try withError { mlxError in
+                let iterator = try TokenIterator(
+                    input: LMInput(text: LMInput.Text(tokens: iterTokens)),
+                    model: context.model,
+                    cache: cache,
+                    parameters: parameters
+                )
+                for token in iterator {
+                    if Task.isCancelled { break }
+                    if token == context.tokenizer.unknownTokenId
+                        || token == context.tokenizer.eosTokenId
+                        || additionalEOSTokenIds.contains(token) {
+                        break
+                    }
+                    detokenizer.append(token: token)
+                    generated += 1
+                    if let chunk = detokenizer.next() { completion += chunk }
+                    // The choice ends at the value's closing quote.
+                    if completion.contains("\"") { break }
+                }
+                Stream().synchronize()
+                try mlxError.check()
+            }
+
+            // The cache now holds: full render + prefill + generated completion.
+            state.consumedInputTokens = renderedCount + prefillIDs.count + generated
+
+            let value = String(completion.prefix(while: { $0 != "\"" }))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let choice = signoff.choices.first(where: {
+                value == $0 || value.hasPrefix($0) || (!value.isEmpty && $0.hasPrefix(value))
+            }) ?? signoff.choices[0]
+
+            let promptCount = (canReuse ? renderedCount - consumed : renderedCount) + prefillIDs.count
+            return (choice, prefill + completion, (prompt: promptCount, generation: generated))
+        }
+    }
+
+    /// Finds a pseudo-tool invocation written as plain text — `finish {"status":
+    /// "success"}` — in a pass's visible output. Returns the parsed call plus the
+    /// text with the invocation (and everything after it, e.g. repeated attempts)
+    /// removed. Requires a brace-delimited argument object directly after the
+    /// name, so prose mentions of the word never match.
+    private static func trailingBarePseudoCall(
+        in text: String,
+        names: [String]
+    ) -> (name: String, arguments: [String: String], strippedText: String)? {
+        for name in names {
+            var searchRange = text.startIndex..<text.endIndex
+            while let nameRange = text.range(of: name, range: searchRange) {
+                searchRange = nameRange.upperBound..<text.endIndex
+                // Word boundary before the name — don't match "unfinished".
+                if nameRange.lowerBound > text.startIndex {
+                    let prev = text[text.index(before: nameRange.lowerBound)]
+                    if prev.isLetter || prev.isNumber { continue }
+                }
+                var i = nameRange.upperBound
+                while i < text.endIndex, text[i] == " " || text[i] == ":" || text[i] == "\n" {
+                    i = text.index(after: i)
+                }
+                guard i < text.endIndex, text[i] == "{",
+                      let close = matchingBrace(in: text, from: i),
+                      let args = ToolStreamParser.parseArguments(String(text[i...close]))
+                else { continue }
+                let stripped = String(text[..<nameRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return (name, args, stripped)
+            }
+        }
+        return nil
+    }
+
+    /// Index of the brace closing the object opened at `open`, tracking string
+    /// literals so braces inside values don't unbalance the scan.
+    private static func matchingBrace(in text: String, from open: String.Index) -> String.Index? {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var i = open
+        while i < text.endIndex {
+            let ch = text[i]
+            if inString {
+                if escaped { escaped = false }
+                else if ch == "\\" { escaped = true }
+                else if ch == "\"" { inString = false }
+            } else {
+                switch ch {
+                case "\"": inString = true
+                case "{": depth += 1
+                case "}":
+                    depth -= 1
+                    if depth == 0 { return i }
+                default: break
+                }
+            }
+            i = text.index(after: i)
+        }
+        return nil
     }
 
     /// Returns the composed system message content (preamble + chat's system prompt)

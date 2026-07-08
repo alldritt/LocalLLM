@@ -9,6 +9,10 @@ final class ToolStreamParser {
     enum Output {
         case text(String)
         case toolCall(name: String, arguments: [String: String])
+        /// A <tool_call> block whose JSON couldn't be parsed even after repair,
+        /// or one left unterminated at end of generation. Never dropped silently —
+        /// the loop feeds an error back to the model so it can retry.
+        case malformedToolCall(raw: String)
     }
 
     private static let openTag = "<tool_call>"
@@ -24,7 +28,13 @@ final class ToolStreamParser {
     func finish() -> [Output] {
         var out: [Output] = []
         if !buffer.isEmpty {
-            out.append(.text(buffer))
+            // An unterminated <tool_call> at end of generation (e.g. the output
+            // token cap hit mid-arguments) is a malformed call, not visible text.
+            if buffer.contains(Self.openTag) {
+                out.append(.malformedToolCall(raw: buffer))
+            } else {
+                out.append(.text(buffer))
+            }
             buffer = ""
         }
         return out
@@ -46,6 +56,8 @@ final class ToolStreamParser {
                 let json = String(buffer[afterOpen..<closeRange.lowerBound])
                 if let parsed = Self.parseToolCall(json) {
                     out.append(.toolCall(name: parsed.name, arguments: parsed.arguments))
+                } else {
+                    out.append(.malformedToolCall(raw: json))
                 }
                 buffer = String(buffer[closeRange.upperBound...])
                 continue
@@ -78,6 +90,18 @@ final class ToolStreamParser {
         return nil
     }
 
+    /// Parses a bare arguments object — used by ChatSession's bare-text pseudo-call
+    /// rescue, where the model writes `finish {"status": "success"}` as plain text
+    /// instead of a <tool_call> block. Same leniency as tool-call parsing.
+    static func parseArguments(_ json: String) -> [String: String]? {
+        guard let obj = parseObject(json.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return nil
+        }
+        var args: [String: String] = [:]
+        for (k, v) in obj { args[k] = stringify(v) }
+        return args
+    }
+
     private static func parseToolCall(_ json: String) -> (name: String, arguments: [String: String])? {
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let obj = parseObject(trimmed) else { return nil }
@@ -97,14 +121,60 @@ final class ToolStreamParser {
     private static func parseObject(_ candidate: String) -> [String: Any]? {
         var attempt = candidate
         for _ in 0..<3 {
-            if let data = attempt.data(using: .utf8),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                return obj
-            }
+            if let obj = jsonObject(attempt) { return obj }
+            // Repair pass: models emit multiline string values (long `result`
+            // arguments especially) without \n escaping. Escape raw control
+            // characters inside string literals only, then retry.
+            if let obj = jsonObject(escapingControlCharsInStrings(attempt)) { return obj }
             guard attempt.hasPrefix("{{"), attempt.hasSuffix("}}") else { return nil }
             attempt = String(attempt.dropFirst().dropLast())
         }
         return nil
+    }
+
+    private static func jsonObject(_ s: String) -> [String: Any]? {
+        guard let data = s.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// Escapes raw newlines/tabs that appear INSIDE JSON string literals, walking
+    /// the text with a minimal in-string/escape state machine. Control characters
+    /// between tokens (pretty-printed JSON) are untouched — that form parses fine
+    /// on the first attempt anyway.
+    private static func escapingControlCharsInStrings(_ s: String) -> String {
+        var out = String()
+        out.reserveCapacity(s.count)
+        var inString = false
+        var escaped = false
+        for ch in s {
+            if inString {
+                if escaped {
+                    out.append(ch)
+                    escaped = false
+                    continue
+                }
+                switch ch {
+                case "\\":
+                    out.append(ch)
+                    escaped = true
+                case "\"":
+                    out.append(ch)
+                    inString = false
+                case "\n":
+                    out.append("\\n")
+                case "\r":
+                    out.append("\\r")
+                case "\t":
+                    out.append("\\t")
+                default:
+                    out.append(ch)
+                }
+            } else {
+                out.append(ch)
+                if ch == "\"" { inString = true }
+            }
+        }
+        return out
     }
 
     private static func stringify(_ value: Any) -> String {
