@@ -38,7 +38,9 @@ public struct PseudoTool: Sendable {
 
     /// Adapter so pseudo-tools ride the existing spec-building and prefix-cache
     /// fingerprint paths. `execute` is unreachable — calls are intercepted first.
-    var specAdapter: any LocalLLMTool { SpecAdapter(pseudo: self) }
+    /// Public so hosts can include the pseudo-tool spec when prewarming a prefix
+    /// cache for agent-mode turns (the fingerprint must match `runToolLoop`'s).
+    public var specAdapter: any LocalLLMTool { SpecAdapter(pseudo: self) }
 
     private struct SpecAdapter: LocalLLMTool {
         let pseudo: PseudoTool
