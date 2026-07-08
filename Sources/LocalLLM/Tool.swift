@@ -5,7 +5,21 @@ public protocol LocalLLMTool: Sendable {
     var name: String { get }
     var description: String { get }
     var parameters: [LocalLLMToolParameter] { get }
+    /// Whether executing this tool changes state outside the app. Drives the
+    /// loop-level consent batching in `ChatSession`. Defaults to `.read`.
+    var kind: LocalLLMToolKind { get }
     func execute(arguments: [String: String]) async throws -> String
+}
+
+/// Read tools observe; action tools change something (run a script, send a
+/// message, write a file). Only action tools pass through user consent.
+public enum LocalLLMToolKind: String, Sendable {
+    case read
+    case action
+}
+
+public extension LocalLLMTool {
+    var kind: LocalLLMToolKind { .read }
 }
 
 public struct LocalLLMToolParameter: Sendable, Hashable {

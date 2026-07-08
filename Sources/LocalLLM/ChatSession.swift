@@ -105,7 +105,8 @@ public actor ChatSession {
     public func streamResponse(
         to userText: String,
         tools: [any LocalLLMTool] = [],
-        agentOptions: AgentLoopOptions? = nil
+        agentOptions: AgentLoopOptions? = nil,
+        consent: (any AgentConsentDelegate)? = nil
     ) -> AsyncThrowingStream<LocalLLMEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -114,6 +115,7 @@ public actor ChatSession {
                     try await self.runToolLoop(
                         tools: tools,
                         agentOptions: agentOptions,
+                        consent: consent,
                         continuation: continuation
                     )
                     continuation.yield(.finished)
@@ -126,9 +128,14 @@ public actor ChatSession {
         }
     }
 
+    /// True after the user grants conversation-scope consent; covers action
+    /// tools for the rest of this session.
+    private var conversationConsentGranted = false
+
     private func runToolLoop(
         tools: [any LocalLLMTool],
         agentOptions: AgentLoopOptions?,
+        consent: (any AgentConsentDelegate)?,
         continuation: AsyncThrowingStream<LocalLLMEvent, Error>.Continuation
     ) async throws {
         let toolsByName = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
@@ -142,6 +149,9 @@ public actor ChatSession {
             tools + (agentOptions?.pseudoTools ?? []).map { $0.specAdapter }
         let passCap = agentOptions?.maxPasses ?? maxToolPasses
         var nudged = false
+        let actionToolNames = Set(tools.filter { $0.kind == .action }.map(\.name))
+        // Task-scope grant: covers action calls for the rest of this turn's loop.
+        var taskConsentGranted = false
         // Accumulated visible text across this turn's passes — the fallback result
         // when a finish pseudo-tool arrives with an empty `result` argument.
         var turnVisibleText = ""
@@ -303,12 +313,47 @@ public actor ChatSession {
                 return
             }
 
-            for parsed in effectiveCalls {
-                let call = LocalLLMToolCall(name: parsed.name, arguments: parsed.arguments)
+            var callObjs = effectiveCalls.map {
+                LocalLLMToolCall(name: $0.name, arguments: $0.arguments)
+            }
+
+            // Loop-level consent: one batched request per pass for its
+            // action-kind calls, unless a task- or conversation-scope grant
+            // already covers them. Applies in agent AND plain mode.
+            var deniedCallIDs: Set<UUID> = []
+            if let consent {
+                let actionCalls = callObjs.filter { actionToolNames.contains($0.name) }
+                if !actionCalls.isEmpty, !taskConsentGranted, !conversationConsentGranted {
+                    let decision = await consent.requestConsent(for: actionCalls)
+                    deniedCallIDs = Set(actionCalls.map(\.id))
+                        .subtracting(decision.approvedCallIDs)
+                    for (idx, call) in callObjs.enumerated() {
+                        if let override = decision.argumentOverrides[call.id] {
+                            callObjs[idx] = LocalLLMToolCall(
+                                id: call.id, name: call.name, arguments: override
+                            )
+                        }
+                    }
+                    switch decision.scope {
+                    case .thisAction: break
+                    case .thisTask: taskConsentGranted = true
+                    case .thisConversation: self.conversationConsentGranted = true
+                    }
+                }
+            }
+
+            for call in callObjs {
                 continuation.yield(.toolCall(call))
 
+                if deniedCallIDs.contains(call.id) {
+                    let msg = "User declined this action."
+                    self.transcript.append(ChatMessage(role: .tool, content: msg))
+                    continuation.yield(.toolResult(call: call, content: msg, isError: true))
+                    continue
+                }
+
                 if let pseudo = pseudoByName[call.name] {
-                    switch await pseudo.handler(parsed.arguments) {
+                    switch await pseudo.handler(call.arguments) {
                     case .continueLoop(let toolResult):
                         self.transcript.append(ChatMessage(role: .tool, content: toolResult))
                         continuation.yield(.toolResult(call: call, content: toolResult, isError: false))
@@ -327,7 +372,7 @@ public actor ChatSession {
                     }
                 } else if let tool = toolsByName[call.name] {
                     do {
-                        let output = try await tool.execute(arguments: parsed.arguments)
+                        let output = try await tool.execute(arguments: call.arguments)
                         self.transcript.append(ChatMessage(role: .tool, content: output))
                         continuation.yield(.toolResult(call: call, content: output, isError: false))
                     } catch {

@@ -117,6 +117,44 @@ public struct AgentLoopOptions: Sendable {
     }
 }
 
+/// How long an approval lasts.
+public enum ConsentScope: String, Sendable {
+    /// Covers only the calls in the approved batch.
+    case thisAction = "action"
+    /// Covers the rest of the current turn's loop (the default in hosts).
+    case thisTask = "task"
+    /// Covers the rest of this ChatSession.
+    case thisConversation = "conversation"
+}
+
+/// The user's answer to a batched consent request.
+public struct ConsentDecision: Sendable {
+    /// Calls the user approved; the rest return "declined" tool errors.
+    public let approvedCallIDs: Set<UUID>
+    public let scope: ConsentScope
+    /// Per-call argument replacements — e.g. a user-edited script. Applied
+    /// before execution and reflected in the yielded `.toolCall` event.
+    public let argumentOverrides: [UUID: [String: String]]
+
+    public init(
+        approvedCallIDs: Set<UUID>,
+        scope: ConsentScope,
+        argumentOverrides: [UUID: [String: String]] = [:]
+    ) {
+        self.approvedCallIDs = approvedCallIDs
+        self.scope = scope
+        self.argumentOverrides = argumentOverrides
+    }
+}
+
+/// Loop-level consent: called once per pass with that pass's action-kind calls
+/// (unless a task- or conversation-scope grant already covers them). Suspends
+/// until the user decides. Replaces per-call confirmation inside tools — tools
+/// are pure executors; policy lives at the loop boundary.
+public protocol AgentConsentDelegate: Sendable {
+    func requestConsent(for calls: [LocalLLMToolCall]) async -> ConsentDecision
+}
+
 extension ToolPromptDefaults {
     /// Injected once, as a user-role message, when an agent-mode pass produces
     /// neither tool calls nor a finishing pseudo-tool call.
