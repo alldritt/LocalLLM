@@ -47,6 +47,12 @@ public enum LocalLLMEvent: Sendable {
     case toolResult(call: LocalLLMToolCall, content: String, isError: Bool)
     case stats(LocalLLMGenerationStats)
     case finished
+    /// Agent mode only: a pseudo-tool handler explicitly ended the turn.
+    case agentFinished(result: String, status: FinishStatus)
+    /// Agent mode only: the pass budget ran out (or the model went silent twice)
+    /// before any pseudo-tool ended the turn. Not a success — hosts should render
+    /// it as an honest failure carrying whatever the transcript learned.
+    case budgetExhausted(passes: Int)
 }
 
 public enum ToolPromptDefaults {

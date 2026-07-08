@@ -98,15 +98,24 @@ public actor ChatSession {
     /// Streams the model's response to `userText`. When `tools` is non-empty, intercepts
     /// tool calls, executes them, and continues generation until the model returns text
     /// without further tool calls (or `maxToolPasses` is reached).
+    ///
+    /// Passing `agentOptions` switches the turn to agent semantics — pseudo-tool
+    /// interception, an explicit-finish contract, and typed exhaustion. See
+    /// `AgentLoopOptions`. When nil, behavior is exactly the pre-agent loop.
     public func streamResponse(
         to userText: String,
-        tools: [any LocalLLMTool] = []
+        tools: [any LocalLLMTool] = [],
+        agentOptions: AgentLoopOptions? = nil
     ) -> AsyncThrowingStream<LocalLLMEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     self.transcript.append(ChatMessage(role: .user, content: userText))
-                    try await self.runToolLoop(tools: tools, continuation: continuation)
+                    try await self.runToolLoop(
+                        tools: tools,
+                        agentOptions: agentOptions,
+                        continuation: continuation
+                    )
                     continuation.yield(.finished)
                     continuation.finish()
                 } catch {
@@ -119,9 +128,20 @@ public actor ChatSession {
 
     private func runToolLoop(
         tools: [any LocalLLMTool],
+        agentOptions: AgentLoopOptions?,
         continuation: AsyncThrowingStream<LocalLLMEvent, Error>.Continuation
     ) async throws {
         let toolsByName = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+        let pseudoByName = Dictionary(
+            uniqueKeysWithValues: (agentOptions?.pseudoTools ?? []).map { ($0.name, $0) }
+        )
+        // The tool list as the model sees it: real tools plus pseudo-tool specs.
+        // Used for the spec, the system addenda, and the prefix-cache fingerprint —
+        // so agent-mode and plain-mode turns never share a warm cache.
+        let specTools: [any LocalLLMTool] =
+            tools + (agentOptions?.pseudoTools ?? []).map { $0.specAdapter }
+        let passCap = agentOptions?.maxPasses ?? maxToolPasses
+        var nudged = false
 
         var promptTokens = 0
         var generationTokens = 0
@@ -140,14 +160,14 @@ public actor ChatSession {
         if loopState.cache == nil {
             let composedSystem = Self.composedSystemContent(
                 transcript: self.transcript,
-                hasTools: !tools.isEmpty
+                hasTools: !specTools.isEmpty
             )
             if !composedSystem.isEmpty {
                 let modelID = await self.llm.configuration.modelID
                 let fingerprint = PrefixCacheManager.fingerprint(
                     modelID: modelID,
                     composedSystemPrompt: composedSystem,
-                    tools: tools
+                    tools: specTools
                 )
                 warmCacheURL = await PrefixCacheManager.shared.urlIfPresent(fingerprint: fingerprint)
                 prefixCacheLog.debug("lookup fingerprint=\(fingerprint.prefix(12), privacy: .public)… url=\(warmCacheURL?.lastPathComponent ?? "MISS", privacy: .public)")
@@ -169,12 +189,12 @@ public actor ChatSession {
             continuation.yield(.stats(stats))
         }
 
-        for pass in 0..<maxToolPasses {
+        for pass in 0..<passCap {
             // Pass the warm-cache URL only on the first pass; once loopState has a
             // cache, subsequent passes just reuse it.
             let url = pass == 0 ? warmCacheURL : nil
             let (rawText, visibleText, calls, info) = try await singlePass(
-                tools: tools,
+                tools: specTools,
                 state: loopState,
                 warmCacheURL: url,
                 continuation: continuation
@@ -191,6 +211,20 @@ public actor ChatSession {
             self.transcript.append(ChatMessage(role: .assistant, content: rawText))
 
             if calls.isEmpty {
+                if agentOptions != nil {
+                    // Agent contract: silence is not completion. One nudge to call
+                    // finish; a second silent pass ends the turn as exhaustion.
+                    if !nudged {
+                        nudged = true
+                        self.transcript.append(ChatMessage(
+                            role: .user,
+                            content: ToolPromptDefaults.agentFinishNudge
+                        ))
+                        continue
+                    }
+                    continuation.yield(.budgetExhausted(passes: passCount))
+                    return
+                }
                 if visibleText.isEmpty {
                     continuation.yield(.text(
                         "[The model produced no visible output. Try rephrasing the question.]"
@@ -203,7 +237,22 @@ public actor ChatSession {
                 let call = LocalLLMToolCall(name: parsed.name, arguments: parsed.arguments)
                 continuation.yield(.toolCall(call))
 
-                if let tool = toolsByName[call.name] {
+                if let pseudo = pseudoByName[call.name] {
+                    switch await pseudo.handler(parsed.arguments) {
+                    case .continueLoop(let toolResult):
+                        self.transcript.append(ChatMessage(role: .tool, content: toolResult))
+                        continuation.yield(.toolResult(call: call, content: toolResult, isError: false))
+                    case .finish(let result, let status):
+                        // Keep the transcript tool-call/tool-result pattern regular so
+                        // a follow-up turn in this session renders coherently.
+                        self.transcript.append(ChatMessage(
+                            role: .tool,
+                            content: "Finished (\(status.rawValue))."
+                        ))
+                        continuation.yield(.agentFinished(result: result, status: status))
+                        return
+                    }
+                } else if let tool = toolsByName[call.name] {
                     do {
                         let output = try await tool.execute(arguments: parsed.arguments)
                         self.transcript.append(ChatMessage(role: .tool, content: output))
@@ -220,8 +269,12 @@ public actor ChatSession {
                 }
             }
 
-            if pass == maxToolPasses - 1 {
-                continuation.yield(.text("\n[Tool-call budget exhausted after \(maxToolPasses) passes.]"))
+            if pass == passCap - 1 {
+                if agentOptions != nil {
+                    continuation.yield(.budgetExhausted(passes: passCount))
+                } else {
+                    continuation.yield(.text("\n[Tool-call budget exhausted after \(passCap) passes.]"))
+                }
             }
         }
     }
