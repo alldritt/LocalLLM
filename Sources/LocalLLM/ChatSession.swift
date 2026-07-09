@@ -206,12 +206,25 @@ public actor ChatSession {
             // Pass the warm-cache URL only on the first pass; once loopState has a
             // cache, subsequent passes just reuse it.
             let url = pass == 0 ? warmCacheURL : nil
-            let (rawText, visibleText, calls, malformed, info) = try await singlePass(
-                tools: specTools,
-                state: loopState,
-                warmCacheURL: url,
-                continuation: continuation
-            )
+            let passResult: (raw: String, text: String,
+                             calls: [(name: String, arguments: [String: String])],
+                             malformed: [String], info: GenerateCompletionInfo)
+            do {
+                passResult = try await singlePass(
+                    tools: specTools,
+                    state: loopState,
+                    warmCacheURL: url,
+                    continuation: continuation
+                )
+            } catch let error as ChatSessionError {
+                // Agent turns end honestly on context overflow instead of dying
+                // as a raw thrown error mid-task; plain chat keeps throwing (its
+                // host shows the condense hint).
+                guard agentOptions != nil, case .contextOverflow = error else { throw error }
+                continuation.yield(.budgetExhausted(passes: passCount, reason: .contextOverflow))
+                return
+            }
+            let (rawText, visibleText, calls, malformed, info) = passResult
 
             // Bare-text pseudo-call rescue: small models drift out of the
             // <tool_call> format after long text answers and write e.g.
@@ -265,9 +278,16 @@ public actor ChatSession {
                     // generates only the status choice, so format drift is impossible.
                     if let signoff = options.forcedSignoff,
                        let pseudo = pseudoByName[signoff.toolName] {
-                        let micro = try await forcedSignoffChoice(
-                            signoff: signoff, tools: specTools, state: loopState
-                        )
+                        let micro: (choice: String, rawText: String, counts: (prompt: Int, generation: Int))
+                        do {
+                            micro = try await forcedSignoffChoice(
+                                signoff: signoff, tools: specTools, state: loopState
+                            )
+                        } catch let error as ChatSessionError {
+                            guard case .contextOverflow = error else { throw error }
+                            continuation.yield(.budgetExhausted(passes: passCount, reason: .contextOverflow))
+                            return
+                        }
                         promptTokens += micro.counts.prompt
                         generationTokens += micro.counts.generation
                         // Store the exact prefill+completion so the next pass's

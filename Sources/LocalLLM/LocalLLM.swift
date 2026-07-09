@@ -223,7 +223,7 @@ public actor LocalLLM {
         }
     }
 
-    public func updateConfiguration(_ update: (inout Configuration) -> Void) {
+    public func updateConfiguration(_ update: @Sendable (inout Configuration) -> Void) {
         update(&configuration)
     }
 

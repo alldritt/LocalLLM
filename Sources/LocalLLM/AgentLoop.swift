@@ -14,6 +14,9 @@ public enum ExhaustionReason: String, Sendable {
     /// The model produced two tool-call-free passes (one nudge spent) without
     /// ever calling `finish`.
     case noFinishCall = "no_finish_call"
+    /// The rendered prompt outgrew the context window mid-turn. Agent turns end
+    /// honestly with this instead of dying as a raw thrown error.
+    case contextOverflow = "context_overflow"
 }
 
 /// What a pseudo-tool handler wants the loop to do next.
