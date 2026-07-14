@@ -40,6 +40,27 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
         expectedDownloadBytes: 8_310_000_000
     )
 
+    public static let qwen3_5_35B_A3B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3.5-35B-A3B-4bit",
+        displayName: "Qwen 3.5 35B A3B MoE (4-bit)",
+        parameterLabel: "35B",
+        expectedDownloadBytes: 19_800_000_000
+    )
+
+    public static let qwen3_5_27B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3.5-27B-4bit",
+        displayName: "Qwen 3.5 27B (4-bit)",
+        parameterLabel: "27B",
+        expectedDownloadBytes: 15_500_000_000
+    )
+
+    public static let qwen3_5_9B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3.5-9B-MLX-4bit",
+        displayName: "Qwen 3.5 9B (4-bit)",
+        parameterLabel: "9B",
+        expectedDownloadBytes: 5_200_000_000
+    )
+
     public static let qwen3_8B_4bit = ModelPreset(
         id: "mlx-community/Qwen3-8B-4bit",
         displayName: "Qwen 3 8B (4-bit)",
@@ -90,6 +111,9 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
     )
 
     public static let all: [ModelPreset] = [
+        .qwen3_5_35B_A3B_4bit,
+        .qwen3_5_27B_4bit,
+        .qwen3_5_9B_4bit,
         .qwen3_32B_4bit,
         .qwen3_30B_A3B_4bit,
         .qwen3_14B_4bit,
