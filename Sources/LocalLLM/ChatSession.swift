@@ -235,12 +235,14 @@ public actor ChatSession {
             // result-substitution source.
             var effectiveCalls = calls
             var answerText = visibleText
+            var rescuedBareCall = false
             if effectiveCalls.isEmpty, malformed.isEmpty, !pseudoByName.isEmpty,
                let bare = Self.trailingBarePseudoCall(
                    in: visibleText, names: Array(pseudoByName.keys)
                ) {
                 effectiveCalls.append((bare.name, bare.arguments))
                 answerText = bare.strippedText
+                rescuedBareCall = true
             }
             if !answerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 turnVisibleText += (turnVisibleText.isEmpty ? "" : "\n") + answerText
@@ -308,7 +310,9 @@ public actor ChatSession {
                             ))
                             let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
                             let effective = trimmed.isEmpty ? turnVisibleText : result
-                            continuation.yield(.agentFinished(result: effective, status: status))
+                            continuation.yield(.agentFinished(
+                                result: effective, status: status, route: .forcedSignoff
+                            ))
                             return
                         }
                     }
@@ -387,7 +391,11 @@ public actor ChatSession {
                         // Empty result → the turn's streamed text IS the answer.
                         let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
                         let effective = trimmed.isEmpty ? turnVisibleText : result
-                        continuation.yield(.agentFinished(result: effective, status: status))
+                        continuation.yield(.agentFinished(
+                            result: effective,
+                            status: status,
+                            route: rescuedBareCall ? .bareText : .toolCall
+                        ))
                         return
                     }
                 } else if let tool = toolsByName[call.name] {

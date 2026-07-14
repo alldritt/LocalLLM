@@ -62,7 +62,9 @@ public enum LocalLLMEvent: Sendable {
     case stats(LocalLLMGenerationStats)
     case finished
     /// Agent mode only: a pseudo-tool handler explicitly ended the turn.
-    case agentFinished(result: String, status: FinishStatus)
+    /// `route` records how the finishing call arrived (clean tool call, bare-text
+    /// rescue, or forced sign-off) — the compliance diagnostic the bench scores.
+    case agentFinished(result: String, status: FinishStatus, route: FinishRoute)
     /// Agent mode only: the turn ended before any pseudo-tool finished it — either
     /// the pass budget ran out or the model went silent twice without calling
     /// finish (see `ExhaustionReason`). Not a success — hosts should render it as

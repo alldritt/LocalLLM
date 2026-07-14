@@ -7,6 +7,18 @@ public enum FinishStatus: String, Sendable {
     case gaveUp = "gave_up"
 }
 
+/// How the finishing pseudo-tool call reached the loop — the compliance
+/// diagnostic AgentBench scores. `.toolCall` is the clean route; the other two
+/// are safety nets doing their job.
+public enum FinishRoute: String, Sendable {
+    /// The model emitted a proper <tool_call> block.
+    case toolCall = "tool_call"
+    /// The model wrote the call as plain text and the bare-text rescue caught it.
+    case bareText = "bare_text"
+    /// The model went silent and the prefilled sign-off micro-pass decided.
+    case forcedSignoff = "forced_signoff"
+}
+
 /// Why an agent-mode turn ended without a pseudo-tool finishing it.
 public enum ExhaustionReason: String, Sendable {
     /// The configured `maxPasses` ceiling was hit.
