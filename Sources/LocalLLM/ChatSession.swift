@@ -244,6 +244,24 @@ public actor ChatSession {
                 answerText = bare.strippedText
                 rescuedBareCall = true
             }
+            // Envelope-less pseudo-call rescue: a common small-model shape is the
+            // pseudo-tool name as text followed by a tool_call block holding only
+            // the bare arguments object (`finish` text + <tool_call>{{"status":…}}
+            // </tool_call>). parseToolCall rejects that block (no name field), so
+            // rescue over text + block content before treating it as malformed.
+            var rescuedMalformed = false
+            if effectiveCalls.isEmpty, !malformed.isEmpty, !pseudoByName.isEmpty {
+                let combined = answerText + "\n" + malformed.joined(separator: "\n")
+                if let bare = Self.trailingBarePseudoCall(
+                    in: combined, names: Array(pseudoByName.keys)
+                ) {
+                    effectiveCalls.append((bare.name, bare.arguments))
+                    answerText = bare.strippedText
+                    rescuedBareCall = true
+                    rescuedMalformed = true
+                }
+            }
+
             if !answerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 turnVisibleText += (turnVisibleText.isEmpty ? "" : "\n") + answerText
             }
@@ -261,10 +279,11 @@ public actor ChatSession {
             // A malformed tool call is neither silence nor a call — feed the parse
             // failure back to the model as a tool error so it can repair, instead
             // of dropping it invisibly (the pass budget still bounds retries).
-            if effectiveCalls.isEmpty, !malformed.isEmpty {
-                let msg = "Error: your tool call could not be parsed as JSON. "
-                    + "Re-emit it as a single-line JSON object; escape newlines "
-                    + "inside string values as \\n."
+            if effectiveCalls.isEmpty, !malformed.isEmpty, !rescuedMalformed {
+                let msg = "Error: your tool call could not be parsed. Emit exactly "
+                    + "one JSON object of the form {\"name\": \"<tool_name>\", "
+                    + "\"arguments\": { ... }} inside the tool-call tags, on a single "
+                    + "line, with newlines inside string values escaped as \\n."
                 self.transcript.append(ChatMessage(role: .tool, content: msg))
                 continuation.yield(.toolResult(
                     call: LocalLLMToolCall(name: "invalid_tool_call", arguments: [:]),
@@ -370,7 +389,8 @@ public actor ChatSession {
                 continuation.yield(.toolCall(call))
 
                 if deniedCallIDs.contains(call.id) {
-                    let msg = "User declined this action."
+                    let msg = "The user DENIED this action. It was NOT performed. "
+                        + "Do not claim it was done — adapt your approach or give up honestly."
                     self.transcript.append(ChatMessage(role: .tool, content: msg))
                     continuation.yield(.toolResult(call: call, content: msg, isError: true))
                     continue
