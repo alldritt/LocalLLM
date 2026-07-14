@@ -82,8 +82,8 @@ public enum ToolPromptDefaults {
 }
 
 enum ToolSpecBuilder {
-    static func toolSpec(for tool: any LocalLLMTool) -> [String: Any] {
-        var properties: [String: Any] = [:]
+    static func toolSpec(for tool: any LocalLLMTool) -> [String: any Sendable] {
+        var properties: [String: any Sendable] = [:]
         var required: [String] = []
         for p in tool.parameters {
             properties[p.name] = [
@@ -92,17 +92,19 @@ enum ToolSpecBuilder {
             ]
             if p.isRequired { required.append(p.name) }
         }
+        let parameters: [String: any Sendable] = [
+            "type": "object",
+            "properties": properties,
+            "required": required
+        ]
+        let function: [String: any Sendable] = [
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": parameters
+        ]
         return [
             "type": "function",
-            "function": [
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": [
-                    "type": "object",
-                    "properties": properties,
-                    "required": required
-                ]
-            ]
+            "function": function
         ]
     }
 }

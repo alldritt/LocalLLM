@@ -104,6 +104,11 @@ final class ToolStreamParser {
 
     private static func parseToolCall(_ json: String) -> (name: String, arguments: [String: String])? {
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Qwen 3.5 templates switched the block content from JSON to an XML
+        // function format: <function=name><parameter=key>\nvalue\n</parameter>…
+        if trimmed.hasPrefix("<function=") {
+            return parseFunctionXML(trimmed)
+        }
         guard let obj = parseObject(trimmed) else { return nil }
         guard let name = obj["name"] as? String else { return nil }
         var args: [String: String] = [:]
@@ -111,6 +116,34 @@ final class ToolStreamParser {
             for (k, v) in argsDict {
                 args[k] = stringify(v)
             }
+        }
+        return (name, args)
+    }
+
+    /// Parses the Qwen 3.5 XML function format:
+    /// `<function=NAME>` then repeated `<parameter=KEY>\nVALUE\n</parameter>`,
+    /// closed by `</function>`. Values keep their content verbatim except the
+    /// single framing newline on each side that the template mandates.
+    private static func parseFunctionXML(_ body: String) -> (name: String, arguments: [String: String])? {
+        guard let nameEnd = body.firstIndex(of: ">") else { return nil }
+        let nameStart = body.index(body.startIndex, offsetBy: "<function=".count)
+        guard nameStart < nameEnd else { return nil }
+        let name = String(body[nameStart..<nameEnd]).trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return nil }
+
+        var args: [String: String] = [:]
+        var search = body[body.index(after: nameEnd)...]
+        while let pStart = search.range(of: "<parameter=") {
+            guard let keyEnd = search[pStart.upperBound...].firstIndex(of: ">") else { break }
+            let key = String(search[pStart.upperBound..<keyEnd])
+            let valueStart = search.index(after: keyEnd)
+            guard let close = search.range(of: "</parameter>", range: valueStart..<search.endIndex)
+            else { break }
+            var value = String(search[valueStart..<close.lowerBound])
+            if value.hasPrefix("\n") { value.removeFirst() }
+            if value.hasSuffix("\n") { value.removeLast() }
+            args[key] = value
+            search = search[close.upperBound...]
         }
         return (name, args)
     }

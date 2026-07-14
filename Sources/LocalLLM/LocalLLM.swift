@@ -220,6 +220,8 @@ public actor LocalLLM {
         do {
             let modelConfig = ModelConfiguration(id: configuration.modelID)
             let loaded = try await LLMModelFactory.shared.loadContainer(
+                from: FlatCacheDownloader(),
+                using: TransformersTokenizerLoader(),
                 configuration: modelConfig
             ) { p in
                 let fraction = p.fractionCompleted
@@ -305,16 +307,17 @@ public actor LocalLLM {
             let toolSpecs = tools.isEmpty
                 ? nil
                 : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
-            let messages: [[String: Any]] = [["role": "system", "content": composedSystemPrompt]]
+            let messages: [[String: any Sendable]] = [
+                ["role": "system", "content": composedSystemPrompt]
+            ]
             let promptTokens: [Int]
             do {
+                // add_generation_prompt:false rides additionalContext; the
+                // TokenizerBridge honors it (3.x protocol has no parameter).
                 promptTokens = try context.tokenizer.applyChatTemplate(
                     messages: messages,
-                    chatTemplate: nil,
-                    addGenerationPrompt: false,
-                    truncation: false,
-                    maxLength: nil,
-                    tools: toolSpecs
+                    tools: toolSpecs,
+                    additionalContext: ["add_generation_prompt": false]
                 )
             } catch {
                 return
@@ -381,7 +384,7 @@ public actor LocalLLM {
         guard let url = configJSONURL(forModelID: id),
               let data = try? Data(contentsOf: url) else { return nil }
 
-        struct ModelConfigJSON: Decodable {
+        struct ConfigFields: Decodable {
             let maxPositionEmbeddings: Int?
             let slidingWindow: Int?
             let useSlidingWindow: Bool?
@@ -391,9 +394,26 @@ public actor LocalLLM {
                 case useSlidingWindow = "use_sliding_window"
             }
         }
+        struct ModelConfigJSON: Decodable {
+            let top: ConfigFields
+            let textConfig: ConfigFields?
+            init(from decoder: Decoder) throws {
+                top = try ConfigFields(from: decoder)
+                let keyed = try decoder.container(keyedBy: Key.self)
+                textConfig = try keyed.decodeIfPresent(ConfigFields.self, forKey: .textConfig)
+            }
+            enum Key: String, CodingKey { case textConfig = "text_config" }
+        }
 
-        guard let cfg = try? JSONDecoder().decode(ModelConfigJSON.self, from: data),
-              let base = cfg.maxPositionEmbeddings, base > 0 else { return nil }
+        // Multimodal checkpoints (Qwen 3.5 VLM layouts) nest the language
+        // model's fields under `text_config`; prefer top-level when present.
+        guard let decoded = try? JSONDecoder().decode(ModelConfigJSON.self, from: data) else {
+            return nil
+        }
+        let cfg = decoded.top.maxPositionEmbeddings != nil
+            ? decoded.top
+            : (decoded.textConfig ?? decoded.top)
+        guard let base = cfg.maxPositionEmbeddings, base > 0 else { return nil }
 
         // `max_position_embeddings` is authoritative on modern HF configs — it
         // already reflects the usable length even when RoPE scaling is present

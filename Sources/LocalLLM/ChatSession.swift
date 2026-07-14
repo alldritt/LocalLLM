@@ -481,7 +481,7 @@ public actor ChatSession {
                 }
             }
             let chatMessages = snapshot.map(Self.makeChatMessage)
-            let toolSpecs: [[String: Any]]? = tools.isEmpty
+            let toolSpecs: [[String: any Sendable]]? = tools.isEmpty
                 ? nil
                 : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
             let fullInput = try await context.processor.prepare(
@@ -662,7 +662,7 @@ public actor ChatSession {
 
         return try await container.perform { context in
             let chatMessages = snapshot.map(Self.makeChatMessage)
-            let toolSpecs: [[String: Any]]? = tools.isEmpty
+            let toolSpecs: [[String: any Sendable]]? = tools.isEmpty
                 ? nil
                 : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
             let fullInput = try await context.processor.prepare(
