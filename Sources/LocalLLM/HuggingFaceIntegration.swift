@@ -15,7 +15,14 @@ import Tokenizers
 //    cache prewarm must render the system+tools prefix WITHOUT the assistant
 //    generation prompt or the baked KV is not a prefix of real turns.
 
-/// Downloads snapshots into (and prefers) the flat cache layout.
+/// Downloads models into (and prefers) the flat cache layout.
+///
+/// Files are fetched individually with `transport: .lfs` — the classic resolve
+/// endpoint — because `downloadSnapshot` hardwires automatic transport, which
+/// routes files >=16 MiB through Hugging Face's Xet protocol; on networks where
+/// the Xet CAS endpoint stalls, every large-model download times out at 0%.
+/// Per-file downloads with size checks also give us resume and idempotent
+/// template top-ups for free.
 public struct FlatCacheDownloader: Downloader {
     public init() {}
 
@@ -36,55 +43,97 @@ public struct FlatCacheDownloader: Downloader {
             )
         }
 
-        // Complete pre-existing download (config + at least one weights file).
+        // Offline fast path: a complete pre-existing download (config + weights
+        // + a usable chat template) never touches the network.
         let hasWeights = fm.fileExists(atPath: flat.appendingPathComponent("config.json").path)
             && ((try? fm.contentsOfDirectory(atPath: flat.path))?
                 .contains(where: { $0.hasSuffix(".safetensors") }) ?? false)
-        if hasWeights {
-            // Older downloads fetched only *.json/*.safetensors and missed
-            // standalone chat templates (Qwen 3.5 ships chat_template.jinja).
-            // Top up just those files; best-effort so offline use still works
-            // for models whose template lives in tokenizer_config.json.
-            if !Self.hasChatTemplate(in: flat),
-               let snapshot = try? await HubClient().downloadSnapshot(
-                   of: repoID,
-                   revision: revision ?? "main",
-                   matching: ["chat_template*", "*.jinja"],
-                   progressHandler: { @MainActor _ in }
-               ),
-               let items = try? fm.contentsOfDirectory(at: snapshot, includingPropertiesForKeys: nil) {
-                for item in items {
-                    let dest = flat.appendingPathComponent(item.lastPathComponent)
-                    // Remove any stale entry (including dangling symlinks, which
-                    // fileExists reports as absent but copyItem trips over).
-                    try? fm.removeItem(at: dest)
-                    // Hub snapshots are symlink farms into a blobs store; copy
-                    // the resolved target or the relative link breaks here.
-                    try? fm.copyItem(at: item.resolvingSymlinksInPath(), to: dest)
-                }
-            }
+        if hasWeights && Self.hasChatTemplate(in: flat) {
             return flat
         }
-        let snapshot = try await HubClient().downloadSnapshot(
-            of: repoID,
-            revision: revision ?? "main",
-            matching: patterns,
-            progressHandler: { @MainActor progress in
-                progressHandler(progress)
-            }
-        )
 
-        // Mirror into the flat layout so cache checks, disk polling, and
-        // nativeContextWindow all keep working against one location. Hub
-        // snapshots are symlink farms into a blobs store — copy resolved
-        // targets, never the (relative) links.
+        let client = HubClient()
+        let rev = revision ?? "main"
+        let entries: [Git.TreeEntry]
+        do {
+            entries = try await client.listFiles(in: repoID, revision: rev)
+        } catch {
+            // Listing failed (offline?) — with weights present, let the load
+            // proceed; the template may live in tokenizer_config.json.
+            if hasWeights { return flat }
+            throw error
+        }
+
+        // Standalone chat templates ride along regardless of the caller's
+        // patterns (Qwen 3.5 ships chat_template.jinja; mlx-lm's patterns
+        // don't always include it).
+        let wanted = entries.filter { entry in
+            Self.matches(entry.path, patterns: patterns)
+                || entry.path.hasPrefix("chat_template")
+        }
+
         try fm.createDirectory(at: flat, withIntermediateDirectories: true)
-        for item in try fm.contentsOfDirectory(at: snapshot, includingPropertiesForKeys: nil) {
-            let dest = flat.appendingPathComponent(item.lastPathComponent)
+        let totalBytes = Int64(wanted.compactMap(\.size).reduce(0, +))
+        var doneBytes: Int64 = 0
+
+        for entry in wanted {
+            let dest = flat.appendingPathComponent(entry.path)
+
+            // Already complete (size matches) — skip. This makes interrupted
+            // downloads resumable and template top-ups idempotent.
+            if let size = entry.size,
+               let attrs = try? fm.attributesOfItem(atPath: dest.path),
+               (attrs[.size] as? Int) == size {
+                doneBytes += Int64(size)
+                reportProgress(doneBytes, of: totalBytes, via: progressHandler)
+                continue
+            }
+
+            try fm.createDirectory(
+                at: dest.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
             try? fm.removeItem(at: dest)
-            try fm.copyItem(at: item.resolvingSymlinksInPath(), to: dest)
+            _ = try await client.downloadFile(
+                at: entry.path,
+                from: repoID,
+                to: dest,
+                revision: rev,
+                transport: .lfs
+            )
+            doneBytes += Int64(entry.size ?? 0)
+            reportProgress(doneBytes, of: totalBytes, via: progressHandler)
         }
         return flat
+    }
+
+    private func reportProgress(
+        _ done: Int64, of total: Int64,
+        via handler: @Sendable (Progress) -> Void
+    ) {
+        let progress = Progress(totalUnitCount: max(total, 1))
+        progress.completedUnitCount = min(done, max(total, 1))
+        handler(progress)
+    }
+
+    /// Minimal glob matching for hub file patterns (`*` and `?`); an empty
+    /// pattern list matches everything.
+    static func matches(_ path: String, patterns: [String]) -> Bool {
+        guard !patterns.isEmpty else { return true }
+        for pattern in patterns {
+            var regex = "^"
+            for ch in pattern {
+                switch ch {
+                case "*": regex += ".*"
+                case "?": regex += "."
+                default: regex += NSRegularExpression.escapedPattern(for: String(ch))
+                }
+            }
+            regex += "$"
+            if path.range(of: regex, options: .regularExpression) != nil {
+                return true
+            }
+        }
+        return false
     }
 
     /// A chat template is available either as a standalone file or embedded in
