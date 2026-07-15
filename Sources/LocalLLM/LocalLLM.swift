@@ -17,12 +17,6 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
         self.expectedDownloadBytes = expectedDownloadBytes
     }
 
-    public static let qwen3_32B_4bit = ModelPreset(
-        id: "mlx-community/Qwen3-32B-4bit",
-        displayName: "Qwen 3 32B (4-bit)",
-        parameterLabel: "32B",
-        expectedDownloadBytes: 18_400_000_000
-    )
 
     /// MoE: 30B total weights resident, only ~3B active per token — runs much
     /// faster than the dense 32B at a similar memory footprint.
@@ -33,12 +27,6 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
         expectedDownloadBytes: 17_200_000_000
     )
 
-    public static let qwen3_14B_4bit = ModelPreset(
-        id: "mlx-community/Qwen3-14B-4bit",
-        displayName: "Qwen 3 14B (4-bit)",
-        parameterLabel: "14B",
-        expectedDownloadBytes: 8_310_000_000
-    )
 
     public static let qwen3_5_35B_A3B_4bit = ModelPreset(
         id: "mlx-community/Qwen3.5-35B-A3B-4bit",
@@ -68,62 +56,25 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
         expectedDownloadBytes: 4_610_000_000
     )
 
-    public static let qwen3_4B_4bit = ModelPreset(
-        id: "mlx-community/Qwen3-4B-4bit",
-        displayName: "Qwen 3 4B (4-bit)",
-        parameterLabel: "4B",
-        expectedDownloadBytes: 2_260_000_000
-    )
 
-    public static let qwen2_5_32B_4bit = ModelPreset(
-        id: "mlx-community/Qwen2.5-32B-Instruct-4bit",
-        displayName: "Qwen 2.5 32B Instruct (4-bit)",
-        parameterLabel: "32B",
-        expectedDownloadBytes: 18_400_000_000
-    )
 
     public static let qwen2_5_14B_4bit = ModelPreset(
         id: "mlx-community/Qwen2.5-14B-Instruct-4bit",
-        displayName: "Qwen 2.5 14B Instruct (4-bit)",
+        displayName: "Qwen 2.5 14B (legacy baseline)",
         parameterLabel: "14B",
         expectedDownloadBytes: 8_500_000_000
     )
 
-    public static let qwen2_5_7B_4bit = ModelPreset(
-        id: "mlx-community/Qwen2.5-7B-Instruct-4bit",
-        displayName: "Qwen 2.5 7B Instruct (4-bit)",
-        parameterLabel: "7B",
-        expectedDownloadBytes: 4_400_000_000
-    )
 
-    public static let qwen2_5_3B_4bit = ModelPreset(
-        id: "mlx-community/Qwen2.5-3B-Instruct-4bit",
-        displayName: "Qwen 2.5 3B Instruct (4-bit)",
-        parameterLabel: "3B",
-        expectedDownloadBytes: 2_000_000_000
-    )
 
-    public static let llama3_2_3B_4bit = ModelPreset(
-        id: "mlx-community/Llama-3.2-3B-Instruct-4bit",
-        displayName: "Llama 3.2 3B Instruct (4-bit)",
-        parameterLabel: "3B",
-        expectedDownloadBytes: 2_000_000_000
-    )
 
     public static let all: [ModelPreset] = [
         .qwen3_5_35B_A3B_4bit,
         .qwen3_5_27B_4bit,
         .qwen3_5_9B_4bit,
-        .qwen3_32B_4bit,
         .qwen3_30B_A3B_4bit,
-        .qwen3_14B_4bit,
         .qwen3_8B_4bit,
-        .qwen3_4B_4bit,
-        .qwen2_5_32B_4bit,
         .qwen2_5_14B_4bit,
-        .qwen2_5_7B_4bit,
-        .qwen2_5_3B_4bit,
-        .llama3_2_3B_4bit
     ]
 }
 
@@ -164,13 +115,13 @@ public actor LocalLLM {
         public var enableThinking: Bool
 
         public init(
-            modelID: String = "mlx-community/Qwen2.5-32B-Instruct-4bit",
+            modelID: String = "mlx-community/Qwen3.5-9B-MLX-4bit",
             maxTokens: Int = 2048,
             temperature: Float = 0.7,
             topP: Float = 0.95,
             maxContextTokens: Int = 8192,
             estimatedCharsPerToken: Double = 3.5,
-            expectedDownloadBytes: Int64 = 18_400_000_000,
+            expectedDownloadBytes: Int64 = 5_200_000_000,
             toolTemperature: Float = 0.2,
             enableThinking: Bool = false
         ) {
