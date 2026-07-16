@@ -148,6 +148,25 @@ public actor ChatSession {
         let specTools: [any LocalLLMTool] =
             tools + (agentOptions?.pseudoTools ?? []).map { $0.specAdapter }
         let passCap = agentOptions?.maxPasses ?? maxToolPasses
+        // Stall-window budgeting (agent mode): the working limit is passes since
+        // the last *progress* event — a successful, previously-unseen
+        // (name + arguments) real-tool call — not total passes. `passCap` stays
+        // as the absolute runaway backstop. Bounces, nudges, malformed passes,
+        // denied calls, and pseudo-tool calls are not progress.
+        let stallWindow = agentOptions?.stallWindow
+        var successfulSignatures: Set<String> = []
+        var passesSinceProgress = 0
+        // Returns true when the turn should end as `.stalled`. Must be called
+        // exactly once per completed pass, including the early `continue` paths.
+        func stalledAfterPass(progress: Bool) -> Bool {
+            guard agentOptions != nil, let window = stallWindow else { return false }
+            if progress {
+                passesSinceProgress = 0
+                return false
+            }
+            passesSinceProgress += 1
+            return passesSinceProgress >= window
+        }
         var nudged = false
         let actionToolNames = Set(tools.filter { $0.kind == .action }.map(\.name))
         // Task-scope grant: covers action calls for the rest of this turn's loop.
@@ -290,6 +309,10 @@ public actor ChatSession {
                     content: msg,
                     isError: true
                 ))
+                if stalledAfterPass(progress: false) {
+                    continuation.yield(.budgetExhausted(passes: passCount, reason: .stalled))
+                    return
+                }
                 continue
             }
 
@@ -321,6 +344,10 @@ public actor ChatSession {
                         case .continueLoop(let toolResult):
                             self.transcript.append(ChatMessage(role: .tool, content: toolResult))
                             continuation.yield(.toolResult(call: call, content: toolResult, isError: false))
+                            if stalledAfterPass(progress: false) {
+                                continuation.yield(.budgetExhausted(passes: passCount, reason: .stalled))
+                                return
+                            }
                             continue
                         case .finish(let result, let status):
                             self.transcript.append(ChatMessage(
@@ -343,6 +370,10 @@ public actor ChatSession {
                             role: .user,
                             content: ToolPromptDefaults.agentFinishNudge
                         ))
+                        if stalledAfterPass(progress: false) {
+                            continuation.yield(.budgetExhausted(passes: passCount, reason: .stalled))
+                            return
+                        }
                         continue
                     }
                     continuation.yield(.budgetExhausted(passes: passCount, reason: .noFinishCall))
@@ -385,6 +416,7 @@ public actor ChatSession {
                 }
             }
 
+            var passMadeProgress = false
             for call in callObjs {
                 continuation.yield(.toolCall(call))
 
@@ -423,6 +455,12 @@ public actor ChatSession {
                         let output = try await tool.execute(arguments: call.arguments)
                         self.transcript.append(ChatMessage(role: .tool, content: output))
                         continuation.yield(.toolResult(call: call, content: output, isError: false))
+                        // Errors never mark a signature as seen, so an identical
+                        // retry that succeeds after a transient failure still
+                        // counts as progress.
+                        if successfulSignatures.insert(Self.callSignature(call)).inserted {
+                            passMadeProgress = true
+                        }
                     } catch {
                         let msg = "Error: \(error.localizedDescription)"
                         self.transcript.append(ChatMessage(role: .tool, content: msg))
@@ -433,6 +471,11 @@ public actor ChatSession {
                     self.transcript.append(ChatMessage(role: .tool, content: msg))
                     continuation.yield(.toolResult(call: call, content: msg, isError: true))
                 }
+            }
+
+            if stalledAfterPass(progress: passMadeProgress) {
+                continuation.yield(.budgetExhausted(passes: passCount, reason: .stalled))
+                return
             }
 
             if pass == passCap - 1, agentOptions == nil {
@@ -446,6 +489,15 @@ public actor ChatSession {
         if agentOptions != nil {
             continuation.yield(.budgetExhausted(passes: passCount, reason: .passBudget))
         }
+    }
+
+    /// Canonical identity of a tool call for stall detection: name plus
+    /// key-sorted arguments. Two calls with the same signature ask the world
+    /// the same question.
+    private static func callSignature(_ call: LocalLLMToolCall) -> String {
+        call.name + "|" + call.arguments.keys.sorted()
+            .map { "\($0)=\(call.arguments[$0] ?? "")" }
+            .joined(separator: "|")
     }
 
     private func singlePass(

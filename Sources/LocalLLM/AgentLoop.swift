@@ -29,6 +29,11 @@ public enum ExhaustionReason: String, Sendable {
     /// The rendered prompt outgrew the context window mid-turn. Agent turns end
     /// honestly with this instead of dying as a raw thrown error.
     case contextOverflow = "context_overflow"
+    /// `stallWindow` consecutive passes elapsed without progress — no
+    /// successful, previously-unseen (name + arguments) tool call. The model
+    /// was repeating itself rather than advancing. Distinct from `passBudget`:
+    /// this says "stopped advancing", that says "ran out of room".
+    case stalled
 }
 
 /// What a pseudo-tool handler wants the loop to do next.
@@ -114,19 +119,34 @@ public struct ForcedSignoff: Sendable {
 ///   configured (preferred), else one text nudge then honest exhaustion;
 /// - exhaustion yields `.budgetExhausted(passes:reason:)` instead of transcript text.
 public struct AgentLoopOptions: Sendable {
-    /// Iteration ceiling for this turn. Replaces `maxToolPasses` in agent mode.
+    /// Absolute iteration ceiling for this turn — the runaway backstop.
+    /// Replaces `maxToolPasses` in agent mode. With `stallWindow` active this
+    /// can be generous: a fixed pass count measures effort, not progress, so
+    /// the working limit is the stall window and this only kills turns that
+    /// keep finding novel calls without converging.
     public var maxPasses: Int
+    /// Passes allowed without progress, where progress is a successful,
+    /// previously-unseen (name + arguments) tool call this turn. A model
+    /// retrying the same failing script or re-running an identical search
+    /// exhausts with `.stalled` when the window elapses; a model grinding
+    /// through distinct work items earns budget indefinitely (up to
+    /// `maxPasses`). Known limit: a spinner whose useless calls vary their
+    /// arguments each time evades this — the hard cap catches it. nil disables
+    /// stall detection.
+    public var stallWindow: Int?
     /// Pseudo-tools injected into the tool spec and intercepted in-process.
     public var pseudoTools: [PseudoTool]
     /// When set, silence triggers a prefilled sign-off instead of a text nudge.
     public var forcedSignoff: ForcedSignoff?
 
     public init(
-        maxPasses: Int = 15,
+        maxPasses: Int = 60,
+        stallWindow: Int? = 8,
         pseudoTools: [PseudoTool] = [],
         forcedSignoff: ForcedSignoff? = nil
     ) {
         self.maxPasses = maxPasses
+        self.stallWindow = stallWindow
         self.pseudoTools = pseudoTools
         self.forcedSignoff = forcedSignoff
     }
