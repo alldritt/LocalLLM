@@ -383,6 +383,19 @@ public actor LocalLLM {
         return base
     }
 
+    /// Whether `id`'s weights are already on disk and can be loaded without a
+    /// network download. True when we can locate its `config.json` (in either the
+    /// flat or HF-hub layout) alongside at least one `.safetensors` shard in the
+    /// same directory. Never triggers a download — safe to call from the UI (e.g.
+    /// to badge "downloaded" models in the picker) on every menu build.
+    public nonisolated static func isModelDownloaded(id: String) -> Bool {
+        guard let configURL = configJSONURL(forModelID: id) else { return false }
+        let dir = configURL.deletingLastPathComponent()
+        guard let contents = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+        else { return false }
+        return contents.contains { $0.hasSuffix(".safetensors") }
+    }
+
     /// Locates a model's `config.json` across the two on-disk layouts we may have
     /// produced: the flat `<caches>/models/<repo-id>/` path (current loader) and
     /// the HuggingFace-hub `<caches>/huggingface/models--<slug>/snapshots/<rev>/`
