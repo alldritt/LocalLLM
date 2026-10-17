@@ -524,7 +524,7 @@ public actor ChatSession {
             // instances per session so mutation during generation doesn't alias.
             if state.cache == nil, let url = warmCacheURL {
                 do {
-                    let (loadedCache, tc) = try loadPrefixCacheBundle(url: url)
+                    let (loadedCache, tc) = try loadPrefixCacheBundle(url: url, into: context.model.newCache(parameters: parameters))
                     state.cache = loadedCache
                     state.consumedInputTokens = tc
                     prefixCacheLog.debug("loaded url=\(url.lastPathComponent, privacy: .public) promptTokenCount=\(tc) cacheCount=\(loadedCache.count) firstOffset=\(loadedCache.first?.offset ?? -1)")

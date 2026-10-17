@@ -254,23 +254,37 @@ public actor LocalLLM {
         }
         prefixCacheLog.info("prewarm starting fingerprint=\(fingerprint.prefix(12), privacy: .public)…")
 
-        try? await container.perform { context in
+        do { try await container.perform { context in
             let toolSpecs = tools.isEmpty
                 ? nil
                 : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
-            let messages: [[String: any Sendable]] = [
-                ["role": "system", "content": composedSystemPrompt]
-            ]
-            let promptTokens: [Int]
-            do {
+            // Some chat templates (Qwen 3.x) refuse a conversation with no
+            // user message, so the system prompt alone can't be rendered.
+            // Render it with two different placeholder user messages and
+            // keep their common token prefix: exactly what every real request
+            // starts with. A few tokens are left off the end so the boundary
+            // with the user message, where a tokenizer may merge differently,
+            // is never cached.
+            func render(_ user: String) throws -> [Int] {
                 // add_generation_prompt:false rides additionalContext; the
                 // TokenizerBridge honors it (3.x protocol has no parameter).
-                promptTokens = try context.tokenizer.applyChatTemplate(
-                    messages: messages,
+                try context.tokenizer.applyChatTemplate(
+                    messages: [["role": "system", "content": composedSystemPrompt], ["role": "user", "content": user]],
                     tools: toolSpecs,
                     additionalContext: ["add_generation_prompt": false]
                 )
+            }
+            let promptTokens: [Int]
+            do {
+                let a = try render("Hello."), b = try render("What is on my calendar tomorrow?")
+                let common = zip(a, b).prefix { $0 == $1 }.count
+                promptTokens = Array(a.prefix(max(0, common - Self.prewarmBoundaryMargin)))
             } catch {
+                prefixCacheLog.error("prewarm couldn't render the prompt: \(String(describing: error), privacy: .public)")
+                return
+            }
+            guard !promptTokens.isEmpty else {
+                prefixCacheLog.error("prewarm found no common prefix to cache")
                 return
             }
 
@@ -309,8 +323,15 @@ public actor LocalLLM {
             } catch {
                 prefixCacheLog.error("prewarm save FAILED: \(error.localizedDescription, privacy: .public)")
             }
+        } } catch {
+            prefixCacheLog.error("prewarm failed: \(String(describing: error), privacy: .public)")
         }
     }
+
+    /// Tokens left off the end of a prewarmed prefix: the system message's
+    /// end marker and the next message's start, where tokenization may
+    /// depend on what follows.
+    static let prewarmBoundaryMargin = 8
 
     func generateParameters(forTools: Bool = false) -> GenerateParameters {
         GenerateParameters(

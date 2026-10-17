@@ -26,6 +26,12 @@ func savePrefixCacheBundle(url: URL, cache: [KVCache], promptTokenCount: Int) th
     for (i, c) in cache.enumerated() {
         let state = c.state
         metadata["stateCount.\(i)"] = String(state.count)
+        // Hybrid models (Qwen 3.5) mix attention layers with recurrent ones
+        // whose cache type keeps extra state here; restore needs it.
+        if let meta = try? JSONSerialization.data(withJSONObject: c.metaState),
+           let text = String(data: meta, encoding: .utf8) {
+            metadata["metaState.\(i)"] = text
+        }
         for (j, arr) in state.enumerated() {
             arrays["c\(i).\(j)"] = arr
         }
@@ -41,14 +47,19 @@ func savePrefixCacheBundle(url: URL, cache: [KVCache], promptTokenCount: Int) th
     try FileManager.default.moveItem(at: tmp, to: url)
 }
 
-/// Reads a file written by `savePrefixCacheBundle` back into fresh KVCacheSimple objects.
-/// Returns nil if the file is unreadable or in an unexpected format.
-func loadPrefixCacheBundle(url: URL) throws -> (cache: [KVCache], promptTokenCount: Int) {
+/// Reads a file written by `savePrefixCacheBundle` back into `fresh`: the
+/// model's own new caches (`model.newCache`), so each layer keeps its type.
+/// A hybrid model's recurrent layers aren't `KVCacheSimple`; restoring them
+/// as that corrupted generation.
+func loadPrefixCacheBundle(url: URL, into fresh: [KVCache]) throws -> (cache: [KVCache], promptTokenCount: Int) {
     let (arrays, metadata) = try loadArraysAndMetadata(url: url)
     guard let countStr = metadata["cacheCount"], let count = Int(countStr), count > 0 else {
         throw PrefixCacheError.malformed("missing or invalid cacheCount")
     }
     let promptTokenCount = Int(metadata["promptTokenCount"] ?? "") ?? 0
+    guard fresh.count == count else {
+        throw PrefixCacheError.malformed("cache has \(count) layers, the model \(fresh.count)")
+    }
     var caches: [KVCache] = []
     for i in 0..<count {
         let stateCount = Int(metadata["stateCount.\(i)"] ?? "") ?? 2
@@ -59,8 +70,15 @@ func loadPrefixCacheBundle(url: URL) throws -> (cache: [KVCache], promptTokenCou
             }
             stateArrays.append(arr)
         }
-        let cache = KVCacheSimple()
+        var cache = fresh[i]
         cache.state = stateArrays
+        // ArraysCache (recurrent layers) refuses a direct metaState; its state
+        // setter refills the slots in order, which is exact for one
+        // conversation after a prefill (every slot present, no padding).
+        if !(cache is ArraysCache), let text = metadata["metaState.\(i)"],
+           let meta = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String] {
+            cache.metaState = meta
+        }
         caches.append(cache)
     }
     return (caches, promptTokenCount)
