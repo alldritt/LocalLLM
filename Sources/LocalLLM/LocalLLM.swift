@@ -35,6 +35,15 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
         expectedDownloadBytes: 19_800_000_000
     )
 
+    /// Qwen 3.6 (April 2026): 3.5's architecture (qwen3_5_moe), retrained
+    /// with more weight on tool calls and agent work.
+    public static let qwen3_6_35B_A3B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3.6-35B-A3B-4bit",
+        displayName: "Qwen 3.6 35B A3B MoE (4-bit)",
+        parameterLabel: "35B",
+        expectedDownloadBytes: 20_430_000_000
+    )
+
     public static let qwen3_5_27B_4bit = ModelPreset(
         id: "mlx-community/Qwen3.5-27B-4bit",
         displayName: "Qwen 3.5 27B (4-bit)",
@@ -69,6 +78,7 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
 
 
     public static let all: [ModelPreset] = [
+        .qwen3_6_35B_A3B_4bit,
         .qwen3_5_35B_A3B_4bit,
         .qwen3_5_27B_4bit,
         .qwen3_5_9B_4bit,
