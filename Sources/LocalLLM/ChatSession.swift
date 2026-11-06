@@ -579,7 +579,9 @@ public actor ChatSession {
 
             let promptStart = Date.timeIntervalSinceReferenceDate
 
-            let additionalEOSTokenIds = Set(
+            // The model's own end-of-turn ids (config.json's eos_token_id list) as well as
+            // named extras: Gemma 4 ends a turn with <turn|>, not the tokenizer's <eos>.
+            let additionalEOSTokenIds = context.configuration.eosTokenIds.union(
                 context.configuration.extraEOSTokens.compactMap {
                     context.tokenizer.convertTokenToId($0)
                 }
@@ -749,7 +751,9 @@ public actor ChatSession {
             }
             let cache = state.cache!
 
-            let additionalEOSTokenIds = Set(
+            // The model's own end-of-turn ids (config.json's eos_token_id list) as well as
+            // named extras: Gemma 4 ends a turn with <turn|>, not the tokenizer's <eos>.
+            let additionalEOSTokenIds = context.configuration.eosTokenIds.union(
                 context.configuration.extraEOSTokens.compactMap {
                     context.tokenizer.convertTokenToId($0)
                 }
