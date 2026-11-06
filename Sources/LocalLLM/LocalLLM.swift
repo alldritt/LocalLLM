@@ -275,6 +275,38 @@ public actor LocalLLM {
             composedSystemPrompt: composedSystemPrompt,
             tools: tools
         )
+        await prewarm(fingerprint: fingerprint, tools: tools, variants: (
+            (composedSystemPrompt, "Hello."),
+            (composedSystemPrompt, "What is on my calendar tomorrow?")
+        ))
+    }
+
+    /// Like `prewarmPrefix`, for a system prompt that starts with a fixed part and goes on
+    /// with text that changes (a date, a document). Caches just `systemPromptPrefix`; a
+    /// `ChatSession` whose `systemPromptCachePrefix` is the same string reuses it whatever
+    /// follows. The rest of the system prompt should follow a blank line, as the cached part
+    /// is measured against that.
+    public func prewarmSystemPromptPrefix(
+        _ systemPromptPrefix: String,
+        tools: [any LocalLLMTool]
+    ) async {
+        let composed = ChatSession.composedSystemContent(base: systemPromptPrefix, hasTools: !tools.isEmpty)
+        let fingerprint = PrefixCacheManager.fingerprint(
+            modelID: configuration.modelID,
+            composedSystemPrompt: ChatSession.prefixFingerprintTag + composed,
+            tools: tools
+        )
+        await prewarm(fingerprint: fingerprint, tools: tools, variants: (
+            (composed + "\n\nToday is Monday.", "Hello."),
+            (composed + "\n\n(Nothing more.)", "Hello.")
+        ))
+    }
+
+    private func prewarm(
+        fingerprint: String,
+        tools: [any LocalLLMTool],
+        variants: ((system: String, user: String), (system: String, user: String))
+    ) async {
         if await PrefixCacheManager.shared.exists(fingerprint: fingerprint) {
             prefixCacheLog.debug("prewarm skipped (already present) fingerprint=\(fingerprint.prefix(12), privacy: .public)…")
             return
@@ -291,23 +323,24 @@ public actor LocalLLM {
                 : tools.map { ToolSpecBuilder.toolSpec(for: $0) }
             // Some chat templates (Qwen 3.x) refuse a conversation with no
             // user message, so the system prompt alone can't be rendered.
-            // Render it with two different placeholder user messages and
-            // keep their common token prefix: exactly what every real request
-            // starts with. A few tokens are left off the end so the boundary
-            // with the user message, where a tokenizer may merge differently,
-            // is never cached.
-            func render(_ user: String) throws -> [Int] {
+            // Render two variants that differ just after the part to cache
+            // and keep their common token prefix: exactly what every real
+            // request starts with. A few tokens are left off the end so the
+            // boundary, where a tokenizer may merge differently, is never
+            // cached.
+            func render(_ system: String, _ user: String) throws -> [Int] {
                 // add_generation_prompt:false rides additionalContext; the
                 // TokenizerBridge honors it (3.x protocol has no parameter).
                 try context.tokenizer.applyChatTemplate(
-                    messages: [["role": "system", "content": composedSystemPrompt], ["role": "user", "content": user]],
+                    messages: [["role": "system", "content": system], ["role": "user", "content": user]],
                     tools: toolSpecs,
                     additionalContext: ["add_generation_prompt": false]
                 )
             }
             let promptTokens: [Int]
             do {
-                let a = try render("Hello."), b = try render("What is on my calendar tomorrow?")
+                let a = try render(variants.0.system, variants.0.user)
+                let b = try render(variants.1.system, variants.1.user)
                 let common = zip(a, b).prefix { $0 == $1 }.count
                 promptTokens = Array(a.prefix(max(0, common - Self.prewarmBoundaryMargin)))
             } catch {

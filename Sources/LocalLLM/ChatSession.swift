@@ -39,6 +39,18 @@ public actor ChatSession {
 
     private let llm: LocalLLM
 
+    /// The fixed start of this session's system prompt, when the rest changes (a date, a
+    /// document). With a warm cache saved for it by `LocalLLM.prewarmSystemPromptPrefix`,
+    /// the session's first turn skips that part of the prompt.
+    public private(set) var systemPromptCachePrefix: String?
+
+    public func setSystemPromptCachePrefix(_ prefix: String?) {
+        systemPromptCachePrefix = prefix
+    }
+
+    /// Keeps prefix-only caches apart from whole-system-prompt ones.
+    static let prefixFingerprintTag = "[system prompt prefix]\u{0}"
+
     /// KV cache + consumed-token cursor that survives across user turns within this
     /// session. Invalidated when the transcript prefix is no longer guaranteed to
     /// match (system prompt edit, condense, etc.).
@@ -201,7 +213,11 @@ public actor ChatSession {
                     composedSystemPrompt: composedSystem,
                     tools: specTools
                 )
-                warmCacheURL = await PrefixCacheManager.shared.urlIfPresent(fingerprint: fingerprint)
+                if let url = await PrefixCacheManager.shared.urlIfPresent(fingerprint: fingerprint) {
+                    warmCacheURL = url
+                } else {
+                    warmCacheURL = await self.prefixCacheURL(composedSystem: composedSystem, modelID: modelID, tools: specTools)
+                }
                 prefixCacheLog.debug("lookup fingerprint=\(fingerprint.prefix(12), privacy: .public)… url=\(warmCacheURL?.lastPathComponent ?? "MISS", privacy: .public)")
             } else {
                 warmCacheURL = nil
@@ -865,9 +881,26 @@ public actor ChatSession {
     /// Returns the composed system message content (preamble + chat's system prompt)
     /// that `applyingSystemAddenda` would produce, for fingerprinting purposes.
     private static func composedSystemContent(transcript: [ChatMessage], hasTools: Bool) -> String {
-        let base = transcript.first(where: { $0.role == .system })?.content ?? ""
+        composedSystemContent(base: transcript.first(where: { $0.role == .system })?.content ?? "", hasTools: hasTools)
+    }
+
+    static func composedSystemContent(base: String, hasTools: Bool) -> String {
         guard hasTools else { return base }
         return ToolPromptDefaults.toolTrustPreamble + "\n\n" + base
+    }
+
+    /// The warm cache saved for `systemPromptCachePrefix`, if the system prompt still
+    /// starts with it.
+    private func prefixCacheURL(composedSystem: String, modelID: String, tools: [any LocalLLMTool]) async -> URL? {
+        guard let prefix = systemPromptCachePrefix else { return nil }
+        let composed = Self.composedSystemContent(base: prefix, hasTools: !tools.isEmpty)
+        guard composedSystem.hasPrefix(composed) else { return nil }
+        let fingerprint = PrefixCacheManager.fingerprint(
+            modelID: modelID,
+            composedSystemPrompt: Self.prefixFingerprintTag + composed,
+            tools: tools
+        )
+        return await PrefixCacheManager.shared.urlIfPresent(fingerprint: fingerprint)
     }
 
     private static func applyingSystemAddenda(to transcript: [ChatMessage], hasTools: Bool) -> [ChatMessage] {
