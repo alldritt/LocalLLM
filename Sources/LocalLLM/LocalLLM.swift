@@ -44,6 +44,25 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
         expectedDownloadBytes: 20_430_000_000
     )
 
+    /// Dense 31B: much slower than the MoE models (~11 tok/s on an M1 Max),
+    /// but more accurate on factual recall, and says when it isn't sure.
+    /// Needs a stop on its own end-of-turn token (<turn|>), not just <eos>.
+    public static let gemma4_31B_4bit = ModelPreset(
+        id: "mlx-community/gemma-4-31b-it-4bit",
+        displayName: "Gemma 4 31B (4-bit)",
+        parameterLabel: "31B",
+        expectedDownloadBytes: 18_440_000_000
+    )
+
+    /// MoE: 80B total, ~3B active per token. Fast (~38 tok/s on an M1 Max)
+    /// with broad recall, but ~43 GB resident: 64 GB Macs only.
+    public static let qwen3_next_80B_A3B_4bit = ModelPreset(
+        id: "mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit",
+        displayName: "Qwen 3 Next 80B A3B MoE (4-bit)",
+        parameterLabel: "80B-A3B",
+        expectedDownloadBytes: 44_860_000_000
+    )
+
     public static let qwen3_5_27B_4bit = ModelPreset(
         id: "mlx-community/Qwen3.5-27B-4bit",
         displayName: "Qwen 3.5 27B (4-bit)",
@@ -78,6 +97,8 @@ public struct ModelPreset: Sendable, Identifiable, Hashable {
 
 
     public static let all: [ModelPreset] = [
+        .qwen3_next_80B_A3B_4bit,
+        .gemma4_31B_4bit,
         .qwen3_6_35B_A3B_4bit,
         .qwen3_5_35B_A3B_4bit,
         .qwen3_5_27B_4bit,
