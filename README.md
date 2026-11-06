@@ -1,8 +1,9 @@
 # LocalLLM
 
 A small Swift package that wraps [MLX Swift](https://github.com/ml-explore/mlx-swift) +
-[mlx-swift-examples](https://github.com/ml-explore/mlx-swift-examples) behind a chat-shaped API
-modelled on Apple's `LanguageModelSession`. macOS only.
+[mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm) behind a chat-shaped API
+modelled on Apple's `LanguageModelSession`. macOS only. Local image generation is in the
+separate [LocalImageGen](../LocalImageGen) package.
 
 Default model: **`mlx-community/Qwen2.5-32B-Instruct-4bit`** (~18 GB on disk, ~20–25 tok/s on
 an M1 Max 64 GB; needs ~22 GB of resident memory once warm).

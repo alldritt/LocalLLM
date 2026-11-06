@@ -237,7 +237,7 @@ public actor LocalLLM {
 
     /// Drops the in-memory model, freeing its (multi-GB) weights. The next
     /// `load()` reloads from the on-disk cache. Used to coordinate residency
-    /// with the image generator so a large text model and a large diffusion
+    /// with LocalImageGen's generator so a large text model and a large diffusion
     /// model are never resident at the same time.
     public func unload() {
         container = nil
@@ -490,7 +490,7 @@ public actor LocalLLM {
         let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
 
-        // 1. Flat layout (matches LocalImageGen.modelDirectory, where the loader
+        // 1. Flat layout (matches modelDirectory(forModelID:), where the loader
         //    actually writes text weights).
         let flat = caches
             .appendingPathComponent("models", isDirectory: true)
@@ -515,11 +515,19 @@ public actor LocalLLM {
     }
 
     /// `~/Library/Caches/models/<repo-id>/` — the flat layout the loader writes
-    /// weights to (shared with image models via `LocalImageGenerator`). Used by
-    /// the download progress poller to measure on-disk bytes; must match where
-    /// the files actually land or the progress bar stays at 0%.
+    /// weights to (LocalImageGen's image models live alongside). Used by the
+    /// download progress poller to measure on-disk bytes; must match where the
+    /// files actually land or the progress bar stays at 0%.
     private func modelCacheDirectory() -> URL {
-        LocalImageGenerator.modelDirectory(forModelID: configuration.modelID)
+        Self.modelDirectory(forModelID: configuration.modelID)
+    }
+
+    /// On-disk directory for a model's weights: `~/Library/Caches/models/<repo-id>`.
+    public nonisolated static func modelDirectory(forModelID id: String) -> URL {
+        (FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory()))
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(id, isDirectory: true)
     }
 
     private func startDiskPolling(
